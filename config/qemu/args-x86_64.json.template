@@ -9,5 +9,5 @@
     "-virtfs", "local,path=${WASI0_PATH},mount_tag=wasi0,security_model=passthrough,id=wasi0",
     "-virtfs", "local,path=${WASI1_PATH},mount_tag=wasi1,security_model=passthrough,id=wasi1",
     ${NETWORK}
-    "-object", "rng-builtin,id=rng0", "-device", "virtio-rng-pci,rng=rng0"
+    "-object", "rng-builtin,id=rng0", "-device", "virtio-rng-pci,rng=rng0,max-bytes=1024,period=100"
 ]
