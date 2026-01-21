@@ -753,7 +753,7 @@ RUN echo '#!/bin/sh' > /sbin/c2w-init.sh && \
     echo '/bin/busybox mkdir -p /bin /dev' >> /sbin/c2w-init.sh && \
     echo '/bin/busybox --install -s /bin' >> /sbin/c2w-init.sh && \
     echo 'export PATH="$PATH:/bin"' >> /sbin/c2w-init.sh && \
-    echo 'modprobe -a iso9660 virtio_blk virtio_net virtio_pci virtio_rng overlay' >> /sbin/c2w-init.sh && \
+    echo 'modprobe -a iso9660 virtio_blk virtio_net virtio_pci virtio_rng 9pnet 9pnet_virtio 9p overlay' >> /sbin/c2w-init.sh && \
     echo 'mount -t devtmpfs devtmpfs /dev' >> /sbin/c2w-init.sh && \
     echo 'mkdir -p /sysroot /sysroot-ovl /sysroot-lower' >> /sbin/c2w-init.sh && \
     echo 'mount -t tmpfs tmpfs /sysroot-ovl' >> /sbin/c2w-init.sh && \
@@ -765,9 +765,11 @@ RUN echo '#!/bin/sh' > /sbin/c2w-init.sh && \
     chmod 755 /sbin/c2w-init.sh
 # Add virtio-rng to initramfs features for fast CRNG init
 RUN echo 'kernel/drivers/char/hw_random' > /etc/mkinitfs/features.d/hwrng.modules
+# Add 9p filesystem support for host directory sharing
+RUN printf 'kernel/net/9p\nkernel/fs/9p\n' > /etc/mkinitfs/features.d/9p.modules
 # Build custom initramfs with our init script
 RUN KERNEL_VERSION=$(ls /lib/modules | head -n 1) && \
-    echo "features=\"ata base cdrom ext4 keymap kms mmc nvme raid scsi usb virtio hwrng\"" > /etc/mkinitfs/mkinitfs.conf && \
+    echo "features=\"ata base cdrom ext4 keymap kms mmc nvme raid scsi usb virtio hwrng 9p\"" > /etc/mkinitfs/mkinitfs.conf && \
     mkinitfs -i /sbin/c2w-init.sh -c /etc/mkinitfs/mkinitfs.conf -b / $KERNEL_VERSION && \
     cp /boot/initramfs-virt /out/initramfs
 
