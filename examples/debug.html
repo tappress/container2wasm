@@ -1,0 +1,151 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="utf-8">
+    <title>QEMU-wasm Debug Console</title>
+    <link rel="stylesheet" href="./xterm.css" />
+    <style>
+        body { font-family: monospace; background: #1a1a1a; color: #0f0; margin: 20px; }
+        #terminal { width: 100%; height: 70vh; }
+        #info { margin-bottom: 10px; padding: 8px; background: #222; border: 1px solid #444; }
+        #log { height: 15vh; overflow-y: auto; background: #111; padding: 8px; font-size: 12px; }
+        .error { color: #f00; }
+        .warn { color: #ff0; }
+    </style>
+</head>
+<body>
+    <h3>QEMU-wasm Debug Console</h3>
+
+    <!-- Status panel -->
+    <div id="info">
+        <span>Browser cores: <strong id="hw-cores">-</strong></span> |
+        <span>VM cores: <strong id="vm-cores">-</strong></span> |
+        <span>Workers: <strong id="workers">0</strong></span> |
+        <span>Boot started: <strong id="boot-time">-</strong></span> |
+        <span>Status: <strong id="status">Loading...</strong></span>
+    </div>
+
+    <!-- Terminal -->
+    <div id="terminal"></div>
+
+    <!-- Console log -->
+    <h4>Console Output</h4>
+    <div id="log"></div>
+
+    <script src="./xterm.js"></script>
+    <script src="./xterm-pty.js"></script>
+    <script src="./load.js"></script>
+    <script src="./arg-module.js"></script>
+    <script type="module">
+        import initEmscriptenModule from './out.js';
+
+        // Console capture
+        const logDiv = document.getElementById('log');
+        function log(msg, className = '') {
+            const line = document.createElement('div');
+            line.textContent = `[${new Date().toISOString().substr(11,8)}] ${msg}`;
+            if (className) line.className = className;
+            logDiv.appendChild(line);
+            logDiv.scrollTop = logDiv.scrollHeight;
+        }
+
+        // Capture console
+        const origConsole = { error: console.error, warn: console.warn, log: console.log };
+        console.error = (...args) => { log(args.join(' '), 'error'); origConsole.error(...args); };
+        console.warn = (...args) => { log(args.join(' '), 'warn'); origConsole.warn(...args); };
+
+        // Capture window errors
+        window.onerror = (msg, url, line) => log(`ERROR: ${msg} at ${url}:${line}`, 'error');
+
+        log('Initializing...');
+
+        // Terminal setup
+        const xterm = new Terminal();
+        xterm.open(document.getElementById("terminal"));
+
+        const { master, slave } = openpty();
+        xterm.loadAddon(master);
+
+        Module.pty = slave;
+        Module['mainScriptUrlOrBlob'] = location.origin + "/out.js";
+
+        // Display hardware info
+        document.getElementById('hw-cores').textContent = navigator.hardwareConcurrency || '?';
+
+        // Parse VM cores from QEMU args
+        const args = Module['arguments'] || [];
+        const smpIdx = args.indexOf('-smp');
+        let vmCores = 1;
+        if (smpIdx !== -1 && args[smpIdx + 1]) {
+            const match = args[smpIdx + 1].match(/^(\d+)/);
+            if (match) vmCores = parseInt(match[1]);
+        }
+        document.getElementById('vm-cores').textContent = vmCores;
+
+        // Track workers
+        let workerCount = 0;
+        const origWorker = window.Worker;
+        window.Worker = function(...args) {
+            workerCount++;
+            document.getElementById('workers').textContent = workerCount;
+            log(`Worker created (total: ${workerCount})`);
+            return new origWorker(...args);
+        };
+        window.Worker.prototype = origWorker.prototype;
+
+        // Boot info
+        const bootTime = new Date();
+        document.getElementById('boot-time').textContent = bootTime.toLocaleTimeString();
+
+        let info = "t:" + Math.round(bootTime / 1000) + "\n";
+
+        Module['preRun'].push((mod) => {
+            // Create /pack if it doesn't exist (load.js may have already created it)
+            try { mod.FS.mkdir('/pack'); } catch(e) { /* already exists */ }
+
+            // Debug: List /pack contents before writing info
+            try {
+                const packContents = mod.FS.readdir('/pack');
+                log('/pack contents before info: ' + packContents.join(', '));
+            } catch(e) {
+                log('/pack readdir error: ' + e.message, 'error');
+            }
+
+            mod.FS.writeFile('/pack/info', info);
+
+            // Debug: Verify info was written
+            try {
+                const infoContents = mod.FS.readFile('/pack/info', { encoding: 'utf8' });
+                log('/pack/info written: ' + JSON.stringify(infoContents));
+            } catch(e) {
+                log('/pack/info read error: ' + e.message, 'error');
+            }
+
+            log('Filesystem initialized, starting QEMU...');
+            document.getElementById('status').textContent = 'QEMU starting...';
+        });
+
+        (async () => {
+            try {
+                const instance = await initEmscriptenModule(Module);
+                log('Emscripten module initialized');
+                document.getElementById('status').textContent = 'Booting...';
+
+                // Critical: Proper TTY poll with pty.readable check
+                var oldPoll = Module['TTY'].stream_ops.poll;
+                var pty = Module['pty'];
+                Module['TTY'].stream_ops.poll = function(stream, timeout){
+                    if (!pty.readable) {
+                        return (pty.readable ? 1 : 0) | (pty.writable ? 4 : 0);
+                    }
+                    return oldPoll.call(stream, timeout);
+                }
+            } catch (e) {
+                log(`FATAL: ${e.message}`, 'error');
+                log(`Stack: ${e.stack || '<no stack>'}`, 'error');
+                document.getElementById('status').textContent = 'FAILED';
+            }
+        })();
+    </script>
+</body>
+</html>
