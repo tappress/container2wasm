@@ -198,18 +198,51 @@ Trace linking is a TCG optimization that chains translation blocks - disabled du
 
 2. **Dockerfile changes** (for Alpine kernel):
 ```dockerfile
-# Line 756: Add virtio_rng to modprobe list
-echo 'modprobe -a iso9660 virtio_blk virtio_net virtio_pci virtio_rng overlay'
+# Add virtio_rng to modprobe list (and 9p modules)
+echo 'modprobe -a iso9660 virtio_blk virtio_net virtio_pci virtio_rng 9pnet 9pnet_virtio 9p overlay'
 
-# Lines 766-771: Add hwrng feature to initramfs
+# Add hwrng feature to initramfs
 RUN echo 'kernel/drivers/char/hw_random' > /etc/mkinitfs/features.d/hwrng.modules
-RUN ... mkinitfs ... features="...virtio hwrng"
+RUN ... mkinitfs ... features="...virtio hwrng 9p"
 ```
 
 **How it works:**
 ```
 Browser crypto.getRandomValues() → QEMU rng-builtin backend → virtio-rng PCI device → Linux kernel hwrng → CRNG
 ```
+
+#### Virtio-9p Fix (Jan 2026)
+
+**Problem:** Host directory sharing via virtio-9p wasn't working - mount returned "no such device" even though virtio-9p PCI devices were present.
+
+**Root cause:** Alpine's `linux-virt` kernel has 9p support as **modules**, but:
+1. The modules weren't included in the initramfs
+2. The modules weren't being loaded at boot
+
+**Solution:** Add 9p modules to initramfs and load them at boot.
+
+**Dockerfile changes:**
+```dockerfile
+# Add 9pnet_virtio to modprobe (line ~756)
+echo 'modprobe -a ... 9pnet 9pnet_virtio 9p overlay'
+
+# Create 9p feature file for mkinitfs
+RUN printf 'kernel/net/9p\nkernel/fs/9p\n' > /etc/mkinitfs/features.d/9p.modules
+
+# Include 9p in initramfs features
+features="...virtio hwrng 9p"
+```
+
+**Verification:**
+```bash
+# Before fix - no driver bound:
+virtio0: 0x0009 - no driver
+
+# After fix - 9pnet_virtio driver bound:
+virtio0: 0x0009 - 9pnet_virtio
+```
+
+This enables browser→guest runtime configuration via `/pack/info` file.
 
 See `CLAUDE-DOCKER-WASM.md` for:
 - Detailed I/O architecture (virtio-fs data path, why 150x slower)
