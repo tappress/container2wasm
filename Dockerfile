@@ -23,6 +23,7 @@ ARG EXTERNAL_BUNDLE=
 ARG NO_BINFMT=
 
 ARG LOAD_MODE=single # or separated
+ARG QEMU_KERNEL=alpine # "alpine" for pre-built linux-virt, "custom" for c2w kernel
 
 ARG OUTPUT_NAME=out.wasm # for wasi
 ARG JS_OUTPUT_NAME=out # for emscripten; must not include "."
@@ -53,7 +54,9 @@ COPY . .
 FROM ubuntu:22.04 AS assets-base
 ARG SOURCE_REPO
 ARG SOURCE_REPO_VERSION
-RUN apt-get update && apt-get install -y git
+RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
+    --mount=type=cache,target=/var/lib/apt,sharing=locked \
+    apt-get update && apt-get install -y --no-install-recommends git ca-certificates
 RUN git clone -b ${SOURCE_REPO_VERSION} ${SOURCE_REPO} /assets
 FROM scratch AS assets
 COPY --link --from=assets-base /assets /
@@ -61,7 +64,9 @@ COPY --link --from=assets-base /assets /
 FROM ubuntu:22.04 AS tinyemu-repo-base
 ARG TINYEMU_REPO
 ARG TINYEMU_REPO_VERSION
-RUN apt-get update && apt-get install -y git
+RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
+    --mount=type=cache,target=/var/lib/apt,sharing=locked \
+    apt-get update && apt-get install -y --no-install-recommends git ca-certificates
 RUN git clone ${TINYEMU_REPO} /tinyemu && \
     cd /tinyemu && \
     git checkout ${TINYEMU_REPO_VERSION}
@@ -71,7 +76,9 @@ COPY --link --from=tinyemu-repo-base /tinyemu /
 FROM ubuntu:22.04 AS bochs-repo-base
 ARG BOCHS_REPO
 ARG BOCHS_REPO_VERSION
-RUN apt-get update && apt-get install -y git
+RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
+    --mount=type=cache,target=/var/lib/apt,sharing=locked \
+    apt-get update && apt-get install -y --no-install-recommends git ca-certificates
 RUN git clone ${BOCHS_REPO} /Bochs && \
     cd /Bochs && \
     git checkout ${BOCHS_REPO_VERSION}
@@ -81,7 +88,9 @@ COPY --link --from=bochs-repo-base /Bochs /
 FROM ubuntu:22.04 AS qemu-repo-base
 ARG QEMU_REPO
 ARG QEMU_REPO_VERSION
-RUN apt-get update && apt-get install -y git
+RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
+    --mount=type=cache,target=/var/lib/apt,sharing=locked \
+    apt-get update && apt-get install -y --no-install-recommends git ca-certificates
 RUN git clone --depth 100 ${QEMU_REPO} /qemu && \
     cd /qemu && \
     git checkout ${QEMU_REPO_VERSION}
@@ -128,7 +137,10 @@ RUN if test -f image.json; then mv image.json /out/oci/ ; fi && \
 RUN mv initconfig.json /out/oci/
 
 FROM ubuntu:22.04 AS gcc-riscv64-linux-gnu-base
-RUN apt-get update && apt-get install -y gcc-riscv64-linux-gnu libc-dev-riscv64-cross git make
+RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
+    --mount=type=cache,target=/var/lib/apt,sharing=locked \
+    apt-get update && apt-get install -y --no-install-recommends \
+    gcc-riscv64-linux-gnu libc-dev-riscv64-cross libc6-dev-riscv64-cross git make ca-certificates
 
 FROM gcc-riscv64-linux-gnu-base AS bbl-dev
 WORKDIR /work-buildroot/
@@ -148,12 +160,17 @@ RUN riscv64-linux-gnu-objcopy -O binary bbl bbl.bin && \
     mv bbl.bin /out/
 
 FROM gcc-riscv64-linux-gnu-base AS linux-riscv64-dev-common
-RUN apt-get update && apt-get install -y gperf flex bison bc
+RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
+    --mount=type=cache,target=/var/lib/apt,sharing=locked \
+    apt-get update && apt-get install -y --no-install-recommends gperf flex bison bc
 RUN mkdir /work-buildlinux
 WORKDIR /work-buildlinux
 RUN git clone -b v6.1 --depth 1 https://github.com/torvalds/linux
 
 FROM linux-riscv64-dev-common AS linux-riscv64-dev
+RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
+    --mount=type=cache,target=/var/lib/apt,sharing=locked \
+    apt-get update && apt-get install -y --no-install-recommends libelf-dev
 WORKDIR /work-buildlinux/linux
 COPY --link --from=assets /config/tinyemu/linux_rv64_config ./.config
 RUN make ARCH=riscv CROSS_COMPILE=riscv64-linux-gnu- -j$(nproc) all && \
@@ -271,7 +288,9 @@ ARG WASI_VFS_VERSION
 ARG WASI_SDK_VERSION
 ARG WASI_SDK_VERSION_FULL
 ARG WIZER_VERSION
-RUN apt-get update -y && apt-get install -y make curl git gcc xz-utils
+RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
+    --mount=type=cache,target=/var/lib/apt,sharing=locked \
+    apt-get update -y && apt-get install -y --no-install-recommends make curl git gcc xz-utils ca-certificates
 
 WORKDIR /wasi
 RUN curl -o wasi-sdk.tar.gz -fSL https://github.com/WebAssembly/wasi-sdk/releases/download/wasi-sdk-${WASI_SDK_VERSION}/wasi-sdk-${WASI_SDK_VERSION_FULL}-linux.tar.gz && \
@@ -281,21 +300,25 @@ ENV WASI_SDK_PATH=/wasi/wasi-sdk-${WASI_SDK_VERSION_FULL}
 WORKDIR /work/
 RUN git clone https://github.com/kateinoigakukun/wasi-vfs.git --recurse-submodules && \
     cd wasi-vfs && \
-    git checkout "${WASI_VFS_VERSION}" && \
+    git checkout "${WASI_VFS_VERSION}"
+WORKDIR /work/wasi-vfs
+RUN --mount=type=cache,target=/usr/local/cargo/registry \
+    --mount=type=cache,target=/work/wasi-vfs/target \
     cargo build --target wasm32-unknown-unknown && \
     cargo build --package wasi-vfs-cli && \
     mkdir -p /tools/wasi-vfs/ && \
-    mv target/debug/wasi-vfs target/wasm32-unknown-unknown/debug/libwasi_vfs.a /tools/wasi-vfs/ && \
-    cargo clean
+    cp target/debug/wasi-vfs target/wasm32-unknown-unknown/debug/libwasi_vfs.a /tools/wasi-vfs/
 
 WORKDIR /work/
 RUN git clone https://github.com/bytecodealliance/wizer && \
     cd wizer && \
-    git checkout "${WIZER_VERSION}" && \
+    git checkout "${WIZER_VERSION}"
+WORKDIR /work/wizer
+RUN --mount=type=cache,target=/usr/local/cargo/registry \
+    --mount=type=cache,target=/work/wizer/target \
     cargo build --bin wizer --all-features && \
     mkdir -p /tools/wizer/ && \
-    mv include target/debug/wizer /tools/wizer/ && \
-    cargo clean
+    cp -r include target/debug/wizer /tools/wizer/
 
 COPY --link --from=tinyemu-repo / /tinyemu
 WORKDIR /tinyemu
@@ -359,15 +382,19 @@ ENV EM_PKG_CONFIG_PATH="$PKG_CONFIG_PATH"
 ENV CHOST="wasm32-unknown-linux"
 ENV MAKEFLAGS="-j$(nproc)"
 ENV DEBIAN_FRONTEND=noninteractive
-RUN apt-get update && apt-get install -y \
+RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
+    --mount=type=cache,target=/var/lib/apt,sharing=locked \
+    apt-get update && apt-get install -y \
     autoconf \
+    automake \
     build-essential \
     libglib2.0-dev \
     libtool \
     pkgconf \
     ninja-build \
     pipx
-RUN PIPX_BIN_DIR=/usr/local/bin pipx install meson==1.5.0
+RUN --mount=type=cache,target=/root/.cache/pip \
+    PIPX_BIN_DIR=/usr/local/bin pipx install meson==1.5.0
 RUN mkdir /glib-emscripten
 WORKDIR /glib-emscripten
 RUN mkdir -p $TARGET
@@ -477,16 +504,23 @@ RUN emmake make install
 RUN rm /glib-emscripten/target/lib/libpixman-1.so /glib-emscripten/target/lib/libpixman-1.so.0 /glib-emscripten/target/lib/libpixman-1.so.$PIXMAN_VERSION
 
 FROM ubuntu:22.04 AS gcc-x86-64-linux-gnu-base
-RUN apt-get update && apt-get install -y gcc-x86-64-linux-gnu linux-libc-dev-amd64-cross git make
+RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
+    --mount=type=cache,target=/var/lib/apt,sharing=locked \
+    apt-get update && apt-get install -y --no-install-recommends \
+    gcc-x86-64-linux-gnu linux-libc-dev-amd64-cross libc6-dev-amd64-cross git make ca-certificates
 
 FROM gcc-x86-64-linux-gnu-base AS linux-amd64-dev-common
-RUN apt-get update && apt-get install -y gperf flex bison bc
+RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
+    --mount=type=cache,target=/var/lib/apt,sharing=locked \
+    apt-get update && apt-get install -y --no-install-recommends gperf flex bison bc
 RUN mkdir /work-buildlinux
 WORKDIR /work-buildlinux
 RUN git clone -b v6.1 --depth 1 https://github.com/torvalds/linux
 
 FROM linux-amd64-dev-common AS linux-amd64-dev
-RUN apt-get install -y libelf-dev
+RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
+    --mount=type=cache,target=/var/lib/apt,sharing=locked \
+    apt-get update && apt-get install -y --no-install-recommends libelf-dev
 WORKDIR /work-buildlinux/linux
 COPY --link --from=assets ./config/bochs/linux_x86_config ./.config
 RUN make ARCH=x86 CROSS_COMPILE=x86_64-linux-gnu- -j$(nproc) all && \
@@ -504,7 +538,9 @@ COPY --link --from=linux-amd64-config-dev /work-buildlinux/linux/.config /
 
 FROM gcc-x86-64-linux-gnu-base AS busybox-amd64-dev
 ARG BUSYBOX_VERSION
-RUN apt-get update -y && apt-get install -y gcc bzip2 wget
+RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
+    --mount=type=cache,target=/var/lib/apt,sharing=locked \
+    apt-get update -y && apt-get install -y --no-install-recommends gcc bzip2 wget libc6-dev
 WORKDIR /work
 RUN wget https://busybox.net/downloads/busybox-${BUSYBOX_VERSION}.tar.bz2
 RUN bzip2 -d busybox-${BUSYBOX_VERSION}.tar.bz2
@@ -601,16 +637,23 @@ COPY --link --from=rootfs-amd64-dev /out/rootfs.bin /pack/
 COPY --link --from=bochs-config-dev /out/bochsrc /pack/
 
 FROM ubuntu:22.04 AS gcc-aarch64-linux-gnu-base
-RUN apt-get update && apt-get install -y gcc-aarch64-linux-gnu linux-libc-dev-arm64-cross git make
+RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
+    --mount=type=cache,target=/var/lib/apt,sharing=locked \
+    apt-get update && apt-get install -y --no-install-recommends \
+    gcc-aarch64-linux-gnu linux-libc-dev-arm64-cross libc6-dev-arm64-cross git make ca-certificates
 
 FROM gcc-aarch64-linux-gnu-base AS linux-aarch64-dev-common
-RUN apt-get update && apt-get install -y gperf flex bison bc
+RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
+    --mount=type=cache,target=/var/lib/apt,sharing=locked \
+    apt-get update && apt-get install -y --no-install-recommends gperf flex bison bc
 RUN mkdir /work-buildlinux
 WORKDIR /work-buildlinux
 RUN git clone -b v6.1 --depth 1 https://github.com/torvalds/linux
 
 FROM linux-aarch64-dev-common AS linux-aarch64-dev-qemu
-RUN apt-get install -y libelf-dev
+RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
+    --mount=type=cache,target=/var/lib/apt,sharing=locked \
+    apt-get update && apt-get install -y --no-install-recommends libelf-dev
 WORKDIR /work-buildlinux/linux
 COPY --link --from=assets ./config/qemu/linux_arm64_config ./.config
 RUN make ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- -j$(nproc) all && \
@@ -688,14 +731,49 @@ COPY --link --from=tini-aarch64-dev /out/tini /rootfs/sbin/tini
 RUN mkdir -p /rootfs/proc /rootfs/sys /rootfs/mnt /rootfs/run /rootfs/tmp /rootfs/dev /rootfs/var /rootfs/etc && mknod /rootfs/dev/null c 1 3 && chmod 666 /rootfs/dev/null
 RUN mkdir /out/ && mkisofs -R -o /out/rootfs.bin /rootfs/
 
-FROM linux-amd64-dev-common AS linux-amd64-dev-qemu
-RUN apt-get install -y libelf-dev
+FROM linux-amd64-dev-common AS linux-amd64-dev-qemu-custom
+RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
+    --mount=type=cache,target=/var/lib/apt,sharing=locked \
+    apt-get update && apt-get install -y --no-install-recommends libelf-dev
 WORKDIR /work-buildlinux/linux
 COPY --link --from=assets ./config/qemu/linux_x86_config ./.config
 RUN make ARCH=x86 CROSS_COMPILE=x86_64-linux-gnu- -j$(nproc) all && \
     mkdir /out && \
     mv /work-buildlinux/linux/arch/x86/boot/bzImage /out/bzImage && \
+    touch /out/initramfs-dummy && \
     make clean
+
+# Alpine's pre-built linux-virt kernel (has kvmclock, paravirt support)
+FROM alpine:3.20 AS linux-amd64-dev-qemu-alpine
+RUN apk add --no-cache linux-virt mkinitfs
+# Create custom init script for c2w rootfs handling
+RUN mkdir -p /out && cp /boot/vmlinuz-virt /out/bzImage
+RUN echo '#!/bin/sh' > /sbin/c2w-init.sh && \
+    echo 'set -eu' >> /sbin/c2w-init.sh && \
+    echo '/bin/busybox mkdir -p /bin /dev' >> /sbin/c2w-init.sh && \
+    echo '/bin/busybox --install -s /bin' >> /sbin/c2w-init.sh && \
+    echo 'export PATH="$PATH:/bin"' >> /sbin/c2w-init.sh && \
+    echo 'modprobe -a iso9660 virtio_blk virtio_net virtio_pci virtio_rng overlay' >> /sbin/c2w-init.sh && \
+    echo 'mount -t devtmpfs devtmpfs /dev' >> /sbin/c2w-init.sh && \
+    echo 'mkdir -p /sysroot /sysroot-ovl /sysroot-lower' >> /sbin/c2w-init.sh && \
+    echo 'mount -t tmpfs tmpfs /sysroot-ovl' >> /sbin/c2w-init.sh && \
+    echo 'mkdir /sysroot-ovl/upper /sysroot-ovl/work' >> /sbin/c2w-init.sh && \
+    echo 'mount -t iso9660 -oro /dev/vda /sysroot-lower' >> /sbin/c2w-init.sh && \
+    echo 'mount -t overlay -olowerdir=/sysroot-lower,upperdir=/sysroot-ovl/upper,workdir=/sysroot-ovl/work overlayfs /sysroot' >> /sbin/c2w-init.sh && \
+    echo 'mount -t devtmpfs devtmpfs /sysroot/dev' >> /sbin/c2w-init.sh && \
+    echo 'exec switch_root /sysroot /sbin/init' >> /sbin/c2w-init.sh && \
+    chmod 755 /sbin/c2w-init.sh
+# Add virtio-rng to initramfs features for fast CRNG init
+RUN echo 'kernel/drivers/char/hw_random' > /etc/mkinitfs/features.d/hwrng.modules
+# Build custom initramfs with our init script
+RUN KERNEL_VERSION=$(ls /lib/modules | head -n 1) && \
+    echo "features=\"ata base cdrom ext4 keymap kms mmc nvme raid scsi usb virtio hwrng\"" > /etc/mkinitfs/mkinitfs.conf && \
+    mkinitfs -i /sbin/c2w-init.sh -c /etc/mkinitfs/mkinitfs.conf -b / $KERNEL_VERSION && \
+    cp /boot/initramfs-virt /out/initramfs
+
+# Select kernel based on build arg (default: alpine for kvmclock support)
+ARG QEMU_KERNEL=alpine
+FROM linux-amd64-dev-qemu-${QEMU_KERNEL} AS linux-amd64-dev-qemu
 
 FROM linux-amd64-dev-common AS linux-amd64-config-dev-qemu
 WORKDIR /work-buildlinux/linux
@@ -724,7 +802,9 @@ FROM scratch AS linux-riscv64-config-qemu
 COPY --link --from=linux-riscv64-config-dev-qemu /work-buildlinux/linux/.config /
 
 FROM linux-riscv64-dev-common AS linux-riscv64-dev-qemu
-RUN apt-get install -y libelf-dev
+RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
+    --mount=type=cache,target=/var/lib/apt,sharing=locked \
+    apt-get update && apt-get install -y --no-install-recommends libelf-dev
 WORKDIR /work-buildlinux/linux
 COPY --link --from=assets ./config/qemu/linux_rv64_config ./.config
 RUN make ARCH=riscv CROSS_COMPILE=riscv64-linux-gnu- -j$(nproc) all && \
@@ -745,14 +825,26 @@ ARG LINUX_LOGLEVEL
 ARG VM_MEMORY_SIZE_MB
 ARG VM_CORE_NUMS
 ARG QEMU_MIGRATION
+ARG QEMU_KERNEL
 RUN apt-get update && apt-get install -y gettext-base && mkdir /out
 COPY --link --from=assets /config/qemu/args-x86_64.json.template /args.json.template
-RUN MIGRATION_FLAGS= ; \
+RUN MIGRATION_FLAGS= && \
+    NETWORK_CONFIG='"-netdev", "socket,id=vmnic,connect=localhost:8888", "-device", "virtio-net-pci,netdev=vmnic",' && \
     if test "${QEMU_MIGRATION}" = "true"  ; then \
-      MIGRATION_FLAGS='"-incoming", "file:/pack/vm.state",' ; \
+      MIGRATION_FLAGS='"-incoming", "file:/pack/vm.state",' && \
+      NETWORK_CONFIG='"-nic", "none",' ; \
     fi && \
-    cat /args.json.template | LOGLEVEL=$LINUX_LOGLEVEL MEMORY_SIZE=$VM_MEMORY_SIZE_MB CORE_NUMS=$VM_CORE_NUMS MIGRATION="" WASI0_PATH=/tmp/wasi0 WASI1_PATH=/tmp/wasi1 envsubst > /out/args-before-cp.json && \
-    cat /args.json.template | LOGLEVEL=$LINUX_LOGLEVEL MEMORY_SIZE=$VM_MEMORY_SIZE_MB CORE_NUMS=$VM_CORE_NUMS MIGRATION=$MIGRATION_FLAGS WASI0_PATH=/ WASI1_PATH=/pack envsubst > /out/args.json
+    INITRD= && \
+    INIT_CMDLINE="init=/sbin/tini -- /sbin/init" && \
+    if test "${QEMU_KERNEL}" = "alpine"  ; then \
+      INITRD='"-initrd", "/pack/initramfs",' && \
+      INIT_CMDLINE="no-kvmclock" ; \
+    fi && \
+    export LOGLEVEL=$LINUX_LOGLEVEL MEMORY_SIZE=$VM_MEMORY_SIZE_MB CORE_NUMS=$VM_CORE_NUMS && \
+    export MIGRATION="" INITRD_ARG="$INITRD" INIT_ARG="$INIT_CMDLINE" NETWORK="$NETWORK_CONFIG" WASI0_PATH=/ WASI1_PATH=/pack && \
+    envsubst < /args.json.template > /out/args-before-cp.json && \
+    export MIGRATION="$MIGRATION_FLAGS" INITRD_ARG="$INITRD" INIT_ARG="$INIT_CMDLINE" NETWORK="$NETWORK_CONFIG" WASI0_PATH=/ WASI1_PATH=/pack && \
+    envsubst < /args.json.template > /out/args.json
 RUN echo "Module['arguments'] =" > /out/arg-module.js
 RUN cat /out/args.json >> /out/arg-module.js
 RUN echo ";" >> /out/arg-module.js
@@ -764,12 +856,14 @@ ARG VM_CORE_NUMS
 ARG QEMU_MIGRATION
 RUN apt-get update && apt-get install -y gettext-base && mkdir /out
 COPY --link --from=assets /config/qemu/args-aarch64.json.template /args.json.template
-RUN MIGRATION_FLAGS= ; \
+RUN MIGRATION_FLAGS= && \
+    NETWORK_CONFIG='"-netdev", "socket,id=vmnic,connect=localhost:8888", "-device", "virtio-net-pci,netdev=vmnic"' && \
     if test "${QEMU_MIGRATION}" = "true"  ; then \
-      MIGRATION_FLAGS='"-incoming", "file:/pack/vm.state",' ; \
+      MIGRATION_FLAGS='"-incoming", "file:/pack/vm.state",' && \
+      NETWORK_CONFIG='"-nic", "none"' ; \
     fi && \
-    cat /args.json.template | LOGLEVEL=$LINUX_LOGLEVEL MEMORY_SIZE=$VM_MEMORY_SIZE_MB CORE_NUMS=$VM_CORE_NUMS MIGRATION="" WASI0_PATH=/tmp/wasi0 WASI1_PATH=/tmp/wasi1 envsubst > /out/args-before-cp.json && \
-    cat /args.json.template | LOGLEVEL=$LINUX_LOGLEVEL MEMORY_SIZE=$VM_MEMORY_SIZE_MB CORE_NUMS=$VM_CORE_NUMS MIGRATION=$MIGRATION_FLAGS WASI0_PATH=/ WASI1_PATH=/pack envsubst > /out/args.json
+    cat /args.json.template | LOGLEVEL=$LINUX_LOGLEVEL MEMORY_SIZE=$VM_MEMORY_SIZE_MB CORE_NUMS=$VM_CORE_NUMS MIGRATION="" NETWORK="$NETWORK_CONFIG" WASI0_PATH=/ WASI1_PATH=/pack envsubst > /out/args-before-cp.json && \
+    cat /args.json.template | LOGLEVEL=$LINUX_LOGLEVEL MEMORY_SIZE=$VM_MEMORY_SIZE_MB CORE_NUMS=$VM_CORE_NUMS MIGRATION=$MIGRATION_FLAGS NETWORK="$NETWORK_CONFIG" WASI0_PATH=/ WASI1_PATH=/pack envsubst > /out/args.json
 RUN echo "Module['arguments'] =" > /out/arg-module.js
 RUN cat /out/args.json >> /out/arg-module.js
 RUN echo ";" >> /out/arg-module.js
@@ -781,19 +875,25 @@ ARG VM_CORE_NUMS
 ARG QEMU_MIGRATION
 RUN apt-get update && apt-get install -y gettext-base && mkdir /out
 COPY --link --from=assets /config/qemu/args-riscv64.json.template /args.json.template
-RUN MIGRATION_FLAGS= ; \
+RUN MIGRATION_FLAGS= && \
+    NETWORK_CONFIG='"-netdev", "socket,id=vmnic,connect=localhost:8888", "-device", "virtio-net-pci,netdev=vmnic"' && \
     if test "${QEMU_MIGRATION}" = "true"  ; then \
-      MIGRATION_FLAGS='"-incoming", "file:/pack/vm.state",' ; \
+      MIGRATION_FLAGS='"-incoming", "file:/pack/vm.state",' && \
+      NETWORK_CONFIG='"-nic", "none"' ; \
     fi && \
-    cat /args.json.template | LOGLEVEL=$LINUX_LOGLEVEL MEMORY_SIZE=$VM_MEMORY_SIZE_MB CORE_NUMS=$VM_CORE_NUMS MIGRATION="" WASI0_PATH=/tmp/wasi0 WASI1_PATH=/tmp/wasi1 envsubst > /out/args-before-cp.json && \
-    cat /args.json.template | LOGLEVEL=$LINUX_LOGLEVEL MEMORY_SIZE=$VM_MEMORY_SIZE_MB CORE_NUMS=$VM_CORE_NUMS MIGRATION=$MIGRATION_FLAGS WASI0_PATH=/ WASI1_PATH=/pack envsubst > /out/args.json
+    cat /args.json.template | LOGLEVEL=$LINUX_LOGLEVEL MEMORY_SIZE=$VM_MEMORY_SIZE_MB CORE_NUMS=$VM_CORE_NUMS MIGRATION="" NETWORK="$NETWORK_CONFIG" WASI0_PATH=/ WASI1_PATH=/pack envsubst > /out/args-before-cp.json && \
+    cat /args.json.template | LOGLEVEL=$LINUX_LOGLEVEL MEMORY_SIZE=$VM_MEMORY_SIZE_MB CORE_NUMS=$VM_CORE_NUMS MIGRATION=$MIGRATION_FLAGS NETWORK="$NETWORK_CONFIG" WASI0_PATH=/ WASI1_PATH=/pack envsubst > /out/args.json
 RUN echo "Module['arguments'] =" > /out/arg-module.js
 RUN cat /out/args.json >> /out/arg-module.js
 RUN echo ";" >> /out/arg-module.js
 
 FROM gcc:14 AS qemu-native-dev
-RUN apt-get update && apt-get install -y libffi-dev libglib2.0-dev libpixman-1-dev libattr1 libattr1-dev ninja-build pipx
-RUN PIPX_BIN_DIR=/usr/local/bin pipx install meson==1.5.0
+RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
+    --mount=type=cache,target=/var/lib/apt,sharing=locked \
+    apt-get update && apt-get install -y --no-install-recommends \
+    libffi-dev libglib2.0-dev libpixman-1-dev libattr1 libattr1-dev ninja-build pipx
+RUN --mount=type=cache,target=/root/.cache/pip \
+    PIPX_BIN_DIR=/usr/local/bin pipx install meson==1.5.0
 COPY --link --from=qemu-repo / /qemu
 
 FROM qemu-native-dev AS qemu-x86_64-pack
@@ -805,6 +905,8 @@ RUN make -j $(nproc) qemu-system-x86_64
 RUN mkdir -p /pack/
 COPY --link --from=rootfs-amd64-dev /out/rootfs.bin /pack/
 COPY --link --from=linux-amd64-dev-qemu /out/bzImage /pack/
+# Copy initramfs if it exists (Alpine kernel needs it for virtio modules)
+COPY --link --from=linux-amd64-dev-qemu /out/initram* /pack/
 RUN cp /qemu/pc-bios/bios-256k.bin /pack/
 RUN cp /qemu/pc-bios/kvmvapic.bin /pack/
 RUN cp /qemu/pc-bios/linuxboot_dma.bin /pack/
@@ -813,7 +915,7 @@ RUN cp /qemu/pc-bios/efi-virtio.rom /pack/
 
 COPY --link --from=get-qemu-state-dev /out/get-qemu-state /get-qemu-state
 COPY --link --from=qemu-config-dev-amd64 /out/args-before-cp.json /
-RUN mkdir -p /tmp/wasi0 /tmp/wasi1
+# Note: args-before-cp.json uses WASI0_PATH=/ and WASI1_PATH=/pack to match browser restore paths
 WORKDIR /qemu/build/
 ARG QEMU_MIGRATION
 RUN if test "${QEMU_MIGRATION}" = "true"  ; then /get-qemu-state -output=/pack/vm.state --args-json=/args-before-cp.json ./qemu-system-x86_64 ; fi
@@ -833,7 +935,6 @@ RUN cp /qemu/pc-bios/efi-virtio.rom /pack/
 
 COPY --link --from=get-qemu-state-dev /out/get-qemu-state /get-qemu-state
 COPY --link --from=qemu-config-dev-aarch64 /out/args-before-cp.json /
-RUN mkdir -p /tmp/wasi0 /tmp/wasi1
 WORKDIR /qemu/build/
 ARG QEMU_MIGRATION
 RUN if test "${QEMU_MIGRATION}" = "true"  ; then /get-qemu-state -output=/pack/vm.state --args-json=/args-before-cp.json ./qemu-system-aarch64 ; fi
@@ -852,7 +953,6 @@ RUN cp /qemu/pc-bios/efi-virtio.rom /pack/
 
 COPY --link --from=get-qemu-state-dev /out/get-qemu-state /get-qemu-state
 COPY --link --from=qemu-config-dev-riscv64 /out/args-before-cp.json /
-RUN mkdir -p /tmp/wasi0 /tmp/wasi1
 WORKDIR /qemu/build/
 ARG QEMU_MIGRATION
 RUN if test "${QEMU_MIGRATION}" = "true"  ; then /get-qemu-state -output=/pack/vm.state --args-json=/args-before-cp.json ./qemu-system-riscv64 ; fi
@@ -869,7 +969,7 @@ RUN if test "${LOAD_MODE}" = "single" ; then \
       /emsdk/upstream/emscripten/tools/file_packager.py qemu-system-x86_64.data --preload /pack > load.js ; \
     else \
       mkdir /load && \
-      mkdir /image && cp /pack/bzImage /image/ && /emsdk/upstream/emscripten/tools/file_packager.py /load/image.data --preload /image > /load/image-load.js && \
+      mkdir /image && cp /pack/bzImage /image/ && (cp /pack/initramfs /image/ 2>/dev/null || true) && /emsdk/upstream/emscripten/tools/file_packager.py /load/image.data --preload /image > /load/image-load.js && \
       mkdir /rootfs && cp /pack/rootfs.bin /rootfs/ && /emsdk/upstream/emscripten/tools/file_packager.py /load/rootfs.data --preload /rootfs > /load/rootfs-load.js && \
       mkdir /bios && \
       cp /pack/bios-256k.bin /bios/ && \
@@ -966,7 +1066,9 @@ ARG WASI_SDK_VERSION
 ARG WASI_SDK_VERSION_FULL
 ARG BINARYEN_VERSION
 ARG WIZER_VERSION
-RUN apt-get update -y && apt-get install -y make curl git gcc xz-utils
+RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
+    --mount=type=cache,target=/var/lib/apt,sharing=locked \
+    apt-get update -y && apt-get install -y --no-install-recommends make curl git gcc xz-utils ca-certificates wget
 
 WORKDIR /wasi
 RUN curl -o wasi-sdk.tar.gz -fSL https://github.com/WebAssembly/wasi-sdk/releases/download/wasi-sdk-${WASI_SDK_VERSION}/wasi-sdk-${WASI_SDK_VERSION_FULL}-linux.tar.gz && \
@@ -976,21 +1078,25 @@ ENV WASI_SDK_PATH=/wasi/wasi-sdk-${WASI_SDK_VERSION_FULL}
 WORKDIR /work/
 RUN git clone https://github.com/kateinoigakukun/wasi-vfs.git --recurse-submodules && \
     cd wasi-vfs && \
-    git checkout "${WASI_VFS_VERSION}" && \
+    git checkout "${WASI_VFS_VERSION}"
+WORKDIR /work/wasi-vfs
+RUN --mount=type=cache,target=/usr/local/cargo/registry \
+    --mount=type=cache,target=/work/wasi-vfs/target \
     cargo build --target wasm32-unknown-unknown && \
     cargo build --package wasi-vfs-cli && \
     mkdir -p /tools/wasi-vfs/ && \
-    mv target/debug/wasi-vfs target/wasm32-unknown-unknown/debug/libwasi_vfs.a /tools/wasi-vfs/ && \
-    cargo clean
+    cp target/debug/wasi-vfs target/wasm32-unknown-unknown/debug/libwasi_vfs.a /tools/wasi-vfs/
 
 WORKDIR /work/
 RUN git clone https://github.com/bytecodealliance/wizer && \
     cd wizer && \
-    git checkout "${WIZER_VERSION}" && \
+    git checkout "${WIZER_VERSION}"
+WORKDIR /work/wizer
+RUN --mount=type=cache,target=/usr/local/cargo/registry \
+    --mount=type=cache,target=/work/wizer/target \
     cargo build --bin wizer --all-features && \
     mkdir -p /tools/wizer/ && \
-    mv include target/debug/wizer /tools/wizer/ && \
-    cargo clean
+    cp -r include target/debug/wizer /tools/wizer/
 
 RUN wget -O /tmp/binaryen.tar.gz https://github.com/WebAssembly/binaryen/releases/download/version_${BINARYEN_VERSION}/binaryen-version_${BINARYEN_VERSION}-x86_64-linux.tar.gz
 RUN mkdir -p /binaryen

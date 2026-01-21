@@ -4,8 +4,10 @@
     "-L", "/pack/",
     "-drive", "if=virtio,format=raw,file=/pack/rootfs.bin",
     "-kernel", "/pack/bzImage",
-    "-append", "earlyprintk=ttyS0,115200n8 console=ttyS0,115200n8 slub_debug=F root=/dev/vda rootwait acpi=off ro virtio_net.napi_tx=false loglevel=${LOGLEVEL} QEMU_MODE=1 init=/sbin/tini -- /sbin/init",
+    ${INITRD_ARG}
+    "-append", "earlyprintk=ttyS0,115200n8 console=ttyS0,115200n8 slub_debug=F root=/dev/vda rootwait acpi=off ro virtio_net.napi_tx=false nokaslr nmi_watchdog=0 random.trust_cpu=on loglevel=${LOGLEVEL} QEMU_MODE=1 ${INIT_ARG}",
     "-virtfs", "local,path=${WASI0_PATH},mount_tag=wasi0,security_model=passthrough,id=wasi0",
     "-virtfs", "local,path=${WASI1_PATH},mount_tag=wasi1,security_model=passthrough,id=wasi1",
-    "-netdev", "socket,id=vmnic,connect=localhost:8888", "-device", "virtio-net-pci,netdev=vmnic"
+    ${NETWORK}
+    "-object", "rng-builtin,id=rng0", "-device", "virtio-rng-pci,rng=rng0"
 ]
