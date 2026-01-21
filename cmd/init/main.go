@@ -158,13 +158,24 @@ func doInit() error {
 		// QEMU snapshot can be created here
 		//////////////////////////////////////////////////////////////////////
 		fmt.Printf("==========") // special string not printed
-		for {
+		mountAttempt := 0
+		maxMountAttempts := 10 // Give up after 10 seconds if 9p doesn't work
+		mounted9p := false
+		for mountAttempt < maxMountAttempts {
 			time.Sleep(time.Second) // expect a snapshot is taken
+			mountAttempt++
 			if err := syscall.Mount(packFSTag, packFSDst, "9p", 0, "trans=virtio,version=9p2000.L"); err != nil {
-				//return fmt.Errorf("failed mounting(pack) %q: %w", packFSTag, err)
+				// Log mount errors periodically to help debug
+				if mountAttempt <= 5 || mountAttempt%10 == 0 {
+					fmt.Printf("\n9p mount attempt %d failed: %v\n", mountAttempt, err)
+				}
 				continue
 			}
 			if _, err := os.Stat(filepath.Join(packFSDst, "info")); err == nil {
+				if err := syscall.Unmount(packFSDst, 0); err != nil {
+					return fmt.Errorf("failed unmounting(pack for check) %q: %w", packFSTag, err)
+				}
+				mounted9p = true
 				break // info file exists
 			} else if !errors.Is(err, os.ErrNotExist) {
 				return fmt.Errorf("failed to stat info file: %w", err)
@@ -175,25 +186,30 @@ func doInit() error {
 		}
 		///////////////////////////////////////////////////////////////////////
 
-		// WASI-related filesystems
-		for _, tag := range []string{rootFSTag} {
-			dst := filepath.Join("/mnt", tag)
-			if err := os.Mkdir(dst, 0777); err != nil {
+		if mounted9p {
+			// WASI-related filesystems
+			for _, tag := range []string{rootFSTag, packFSTag} {
+				dst := filepath.Join("/mnt", tag)
+				if err := os.Mkdir(dst, 0777); err != nil && !os.IsExist(err) {
+					return err
+				}
+				log.Printf("mounting %q to %q\n", tag, dst)
+				if err := syscall.Mount(tag, dst, "9p", 0, "trans=virtio,version=9p2000.L"); err != nil {
+					log.Printf("failed mounting %q: %v\n", tag, err)
+					break
+				}
+			}
+
+			infoD, err := os.ReadFile(filepath.Join("/mnt", packFSTag, "info"))
+			if err != nil {
 				return err
 			}
-			log.Printf("mounting %q to %q\n", tag, dst)
-			if err := syscall.Mount(tag, dst, "9p", 0, "trans=virtio,version=9p2000.L"); err != nil {
-				log.Printf("failed mounting %q: %v\n", tag, err)
-				break
-			}
+			log.Printf("INFO:\n%s\n", string(infoD))
+			info = parseInfo(infoD)
+		} else {
+			fmt.Printf("\n9p mount failed after %d attempts, continuing without runtime config\n", maxMountAttempts)
+			// Continue with default empty info - container will run with embedded config
 		}
-
-		infoD, err := os.ReadFile(filepath.Join("/mnt", packFSTag, "info"))
-		if err != nil {
-			return err
-		}
-		log.Printf("INFO:\n%s\n", string(infoD))
-		info = parseInfo(infoD)
 	}
 
 	if info.withNet {
