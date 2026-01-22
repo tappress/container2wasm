@@ -244,6 +244,51 @@ virtio0: 0x0009 - 9pnet_virtio
 
 This enables browser→guest runtime configuration via `/pack/info` file.
 
+#### QEMU Snapshot/Migration (Jan 2026)
+
+**Problem:** Full boot from BIOS → kernel → init takes 2-3 minutes in the browser due to slow emulation.
+
+**Solution:** `QEMU_MIGRATION=true` captures a VM snapshot at build time, then restores from it in the browser for instant boot.
+
+| Metric | Without Snapshot | With Snapshot | Improvement |
+|--------|------------------|---------------|-------------|
+| Browser boot time | 2-3 minutes | ~11 seconds | **10-15x faster** |
+| Data file size | ~40MB | ~140MB | +100MB (vm.state) |
+
+**Build command:**
+```bash
+c2w --to-js --build-arg QEMU_MIGRATION=true alpine:3.20 /tmp/out/
+```
+
+**How it works:**
+1. Native QEMU boots during Docker build
+2. `get-qemu-state` tool waits for `==========` marker from init
+3. Sends `migrate file:/pack/vm.state` via QEMU monitor
+4. VM state (~67MB) is packed into the data file
+5. Browser QEMU uses `-incoming file:/pack/vm.state` to restore
+
+**Requirements for snapshot capture:**
+- Init must print `==========` marker when ready
+- iso9660 module must be in initramfs (for rootfs mount)
+- Timeout: 5 minutes (configurable via `get-qemu-state -timeout`)
+
+**Dockerfile requirements (already implemented):**
+```dockerfile
+# iso9660 module for rootfs mounting
+RUN echo 'kernel/fs/isofs' > /etc/mkinitfs/features.d/isofs.modules
+features="base virtio hwrng 9p isofs cdrom"
+```
+
+**Debugging snapshot capture failures:**
+```bash
+# Build with verbose kernel logging
+c2w --to-js --build-arg QEMU_MIGRATION=true --build-arg LINUX_LOGLEVEL=7 alpine:3.20 /tmp/out/
+
+# Common failure: "Kernel panic - Attempted to kill init!"
+# Cause: iso9660 module missing from initramfs
+# Fix: Ensure isofs.modules feature file exists
+```
+
 See `CLAUDE-DOCKER-WASM.md` for:
 - Detailed I/O architecture (virtio-fs data path, why 150x slower)
 - JIT architecture analysis (why CheerpX is 37x faster)
@@ -526,6 +571,13 @@ The `examples/debug.html` provides:
 
 ### Expected Boot Timeline
 
+**With QEMU_MIGRATION=true (snapshot restore):**
+| Time | Event |
+|------|-------|
+| 0s | "QEMU starting..." |
+| 5-10s | Shell prompt (`/ #`) |
+
+**Without snapshot (full boot):**
 | Time | Event |
 |------|-------|
 | 0s | "QEMU starting..." |
@@ -540,22 +592,31 @@ The `examples/debug.html` provides:
 | Terminal goes blank after SeaBIOS | Missing `pty.readable` check in TTY poll | Use `debug.html` (has fix) |
 | "SharedArrayBuffer is not defined" | Missing COOP/COEP headers | Use `serve.py` instead of basic HTTP server |
 | Workers show 0 | Browser not supporting Web Workers | Use Chrome/Firefox with SharedArrayBuffer |
-| Boot takes 5+ minutes | QEMU_MIGRATION not enabled | Build with `--build-arg QEMU_MIGRATION=true` (if working) |
+| Boot takes 2-3 minutes | QEMU_MIGRATION not enabled | Build with `--build-arg QEMU_MIGRATION=true` |
+| Snapshot capture fails with kernel panic | iso9660 module missing | Rebuild c2w binary after Dockerfile changes |
 
 ### Building Fresh WASM for Testing
 
 ```bash
-# Basic Alpine (1 vCPU, 128MB RAM) - fastest build
+# Basic Alpine with snapshot (recommended - fast browser boot)
 /home/and/Projects/docker-wasm/out/c2w \
     --to-js \
+    --build-arg QEMU_MIGRATION=true \
     alpine:3.20 \
     /home/and/Projects/docker-wasm/examples/
 
-# Multi-core with more RAM (recommended for Docker-in-Docker)
+# Multi-core with more RAM (for Docker-in-Docker)
 /home/and/Projects/docker-wasm/out/c2w \
     --to-js \
     --build-arg VM_CORE_NUMS=4 \
     --build-arg VM_MEMORY_SIZE_MB=512 \
+    --build-arg QEMU_MIGRATION=true \
+    alpine:3.20 \
+    /home/and/Projects/docker-wasm/examples/
+
+# Without snapshot (full boot, smaller data file)
+/home/and/Projects/docker-wasm/out/c2w \
+    --to-js \
     --build-arg QEMU_MIGRATION=false \
     alpine:3.20 \
     /home/and/Projects/docker-wasm/examples/
@@ -566,7 +627,7 @@ The `examples/debug.html` provides:
 | File | Size | Purpose |
 |------|------|---------|
 | `qemu-system-x86_64.wasm` | ~40MB | QEMU compiled to WebAssembly |
-| `qemu-system-x86_64.data` | ~40MB | Packed filesystem (BIOS, kernel, rootfs) |
+| `qemu-system-x86_64.data` | ~40MB / ~140MB | Packed filesystem (larger with vm.state snapshot) |
 | `out.js` | ~227KB | Emscripten module loader |
 | `load.js` | - | Data file loader |
 | `arg-module.js` | - | QEMU arguments (vCPU count, RAM, TCG options) |
