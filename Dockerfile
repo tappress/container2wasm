@@ -767,9 +767,11 @@ RUN echo '#!/bin/sh' > /sbin/c2w-init.sh && \
 RUN echo 'kernel/drivers/char/hw_random' > /etc/mkinitfs/features.d/hwrng.modules
 # Add 9p filesystem support for host directory sharing
 RUN printf 'kernel/net/9p\nkernel/fs/9p\n' > /etc/mkinitfs/features.d/9p.modules
+# Add iso9660 filesystem support for rootfs mounting
+RUN echo 'kernel/fs/isofs' > /etc/mkinitfs/features.d/isofs.modules
 # Build custom initramfs with our init script
 RUN KERNEL_VERSION=$(ls /lib/modules | head -n 1) && \
-    echo "features=\"base virtio hwrng 9p cdrom\"" > /etc/mkinitfs/mkinitfs.conf && \
+    echo "features=\"base virtio hwrng 9p isofs cdrom\"" > /etc/mkinitfs/mkinitfs.conf && \
     mkinitfs -i /sbin/c2w-init.sh -c /etc/mkinitfs/mkinitfs.conf -b / $KERNEL_VERSION && \
     cp /boot/initramfs-virt /out/initramfs
 
