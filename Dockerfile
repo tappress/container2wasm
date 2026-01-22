@@ -769,7 +769,7 @@ RUN echo 'kernel/drivers/char/hw_random' > /etc/mkinitfs/features.d/hwrng.module
 RUN printf 'kernel/net/9p\nkernel/fs/9p\n' > /etc/mkinitfs/features.d/9p.modules
 # Build custom initramfs with our init script
 RUN KERNEL_VERSION=$(ls /lib/modules | head -n 1) && \
-    echo "features=\"ata base cdrom ext4 keymap kms mmc nvme raid scsi usb virtio hwrng 9p\"" > /etc/mkinitfs/mkinitfs.conf && \
+    echo "features=\"base virtio hwrng 9p cdrom\"" > /etc/mkinitfs/mkinitfs.conf && \
     mkinitfs -i /sbin/c2w-init.sh -c /etc/mkinitfs/mkinitfs.conf -b / $KERNEL_VERSION && \
     cp /boot/initramfs-virt /out/initramfs
 
@@ -843,9 +843,9 @@ RUN MIGRATION_FLAGS= && \
       INIT_CMDLINE="no-kvmclock" ; \
     fi && \
     export LOGLEVEL=$LINUX_LOGLEVEL MEMORY_SIZE=$VM_MEMORY_SIZE_MB CORE_NUMS=$VM_CORE_NUMS && \
-    export MIGRATION="" INITRD_ARG="$INITRD" INIT_ARG="$INIT_CMDLINE" NETWORK="$NETWORK_CONFIG" WASI0_PATH=/ WASI1_PATH=/pack && \
+    export MIGRATION="" INITRD_ARG="$INITRD" INIT_ARG="$INIT_CMDLINE" NETWORK="$NETWORK_CONFIG" WASI0_PATH=/ WASI1_PATH=/pack SNAPSHOT_MODE="SNAPSHOT_MODE=1" && \
     envsubst < /args.json.template > /out/args-before-cp.json && \
-    export MIGRATION="$MIGRATION_FLAGS" INITRD_ARG="$INITRD" INIT_ARG="$INIT_CMDLINE" NETWORK="$NETWORK_CONFIG" WASI0_PATH=/ WASI1_PATH=/pack && \
+    export MIGRATION="$MIGRATION_FLAGS" INITRD_ARG="$INITRD" INIT_ARG="$INIT_CMDLINE" NETWORK="$NETWORK_CONFIG" WASI0_PATH=/ WASI1_PATH=/pack SNAPSHOT_MODE="" && \
     envsubst < /args.json.template > /out/args.json
 RUN echo "Module['arguments'] =" > /out/arg-module.js
 RUN cat /out/args.json >> /out/arg-module.js

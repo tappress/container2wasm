@@ -5,7 +5,7 @@
     "-drive", "if=virtio,format=raw,file=/pack/rootfs.bin",
     "-kernel", "/pack/bzImage",
     ${INITRD_ARG}
-    "-append", "earlyprintk=ttyS0,115200n8 console=ttyS0,115200n8 slub_debug=F root=/dev/vda rootwait acpi=off ro virtio_net.napi_tx=false nokaslr nmi_watchdog=0 random.trust_cpu=on loglevel=${LOGLEVEL} QEMU_MODE=1 ${INIT_ARG}",
+    "-append", "earlyprintk=ttyS0,115200n8 console=ttyS0,115200n8 slub_debug=F root=/dev/vda rootwait acpi=off ro virtio_net.napi_tx=false nokaslr nmi_watchdog=0 random.trust_cpu=on mitigations=off no_timer_check tsc=reliable pci=noaer loglevel=${LOGLEVEL} QEMU_MODE=1 ${SNAPSHOT_MODE} ${INIT_ARG}",
     "-virtfs", "local,path=${WASI0_PATH},mount_tag=wasi0,security_model=passthrough,id=wasi0",
     "-virtfs", "local,path=${WASI1_PATH},mount_tag=wasi1,security_model=passthrough,id=wasi1",
     ${NETWORK}

@@ -158,17 +158,21 @@ func doInit() error {
 		// QEMU snapshot can be created here
 		//////////////////////////////////////////////////////////////////////
 		fmt.Printf("==========") // special string not printed
+		// In snapshot mode (build time), sleep to allow state capture at a stable point
+		if os.Getenv("SNAPSHOT_MODE") == "1" {
+			time.Sleep(time.Second)
+		}
 		mountAttempt := 0
-		maxMountAttempts := 10 // Give up after 10 seconds if 9p doesn't work
+		maxMountAttempts := 30 // Up to 30 attempts with 100ms sleep = 3 seconds max
 		mounted9p := false
 		for mountAttempt < maxMountAttempts {
-			time.Sleep(time.Second) // expect a snapshot is taken
 			mountAttempt++
 			if err := syscall.Mount(packFSTag, packFSDst, "9p", 0, "trans=virtio,version=9p2000.L"); err != nil {
 				// Log mount errors periodically to help debug
-				if mountAttempt <= 5 || mountAttempt%10 == 0 {
+				if mountAttempt == 1 || mountAttempt%10 == 0 {
 					fmt.Printf("\n9p mount attempt %d failed: %v\n", mountAttempt, err)
 				}
+				time.Sleep(100 * time.Millisecond) // Only sleep after failure
 				continue
 			}
 			if _, err := os.Stat(filepath.Join(packFSDst, "info")); err == nil {

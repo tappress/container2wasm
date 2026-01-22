@@ -64,9 +64,42 @@
         xterm.open(document.getElementById("terminal"));
 
         const { master, slave } = openpty();
-        xterm.loadAddon(master);
 
+        xterm.loadAddon(master);
         Module.pty = slave;
+
+        // Log TTY markers by polling terminal content
+        let lastLine = '';
+        let markerLogged = false;
+        let shellLogged = false;
+        setInterval(() => {
+            const buffer = xterm.buffer.active;
+            let content = '';
+            for (let i = Math.max(0, buffer.cursorY - 5); i <= buffer.cursorY; i++) {
+                const line = buffer.getLine(i);
+                if (line) content += line.translateToString() + '\n';
+            }
+            if (!markerLogged && content.includes('==========')) {
+                log('TTY: ========== marker');
+                markerLogged = true;
+            }
+            if (!shellLogged && content.includes('/ #')) {
+                log('TTY: Shell prompt');
+                shellLogged = true;
+            }
+            if (content.includes('9p mount attempt') && content !== lastLine) {
+                const match = content.match(/9p mount attempt \d+ failed[^\n]*/);
+                if (match) log('TTY: ' + match[0]);
+            }
+            // Log TIMING markers
+            const timingMatch = content.match(/\[TIMING\][^\n]*/g);
+            if (timingMatch && content !== lastLine) {
+                timingMatch.forEach(m => {
+                    if (!lastLine.includes(m)) log('TTY: ' + m);
+                });
+            }
+            lastLine = content;
+        }, 500);
         Module['mainScriptUrlOrBlob'] = location.origin + "/out.js";
 
         // Display hardware info
