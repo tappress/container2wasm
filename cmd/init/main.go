@@ -36,6 +36,89 @@ func main() {
 	}
 }
 
+// rebind9pDrivers unbinds and rebinds virtio-9p drivers to reset device state.
+// This is needed after snapshot restore because the virtio-9p backend state
+// from build time doesn't match the new browser filesystem.
+func rebind9pDrivers() error {
+	// Remount sysfs as read-write (it may be mounted ro)
+	if err := syscall.Mount("", "/sys", "", syscall.MS_REMOUNT, ""); err != nil {
+		log.Printf("Warning: failed to remount /sys rw: %v", err)
+		// Continue anyway, might already be rw
+	}
+	defer func() {
+		// Restore sysfs to read-only
+		syscall.Mount("", "/sys", "", syscall.MS_REMOUNT|syscall.MS_RDONLY, "")
+	}()
+
+	// Wait for virtio devices to appear (may take time after snapshot restore)
+	devicesPath := "/sys/bus/virtio/devices"
+	var entries []os.DirEntry
+	var err error
+	for i := 0; i < 50; i++ { // Wait up to 5 seconds
+		entries, err = os.ReadDir(devicesPath)
+		if err == nil && len(entries) > 0 {
+			break
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+	if err != nil {
+		return fmt.Errorf("cannot read virtio devices: %w", err)
+	}
+	if len(entries) == 0 {
+		return fmt.Errorf("no virtio devices found")
+	}
+	log.Printf("Found %d virtio devices", len(entries))
+
+	for _, entry := range entries {
+		devicePath := filepath.Join(devicesPath, entry.Name())
+
+		// Check if this is a 9p device (device ID 9)
+		modalias, err := os.ReadFile(filepath.Join(devicePath, "modalias"))
+		if err != nil {
+			continue
+		}
+
+		// virtio:d00000009v... means device ID 9 (9p)
+		if !strings.Contains(string(modalias), "d00000009") {
+			continue
+		}
+
+		deviceName := entry.Name()
+		driverPath := "/sys/bus/virtio/drivers/9pnet_virtio"
+
+		// Check if driver is bound
+		if _, err := os.Stat(filepath.Join(devicePath, "driver")); err != nil {
+			log.Printf("9p device %s has no driver bound, skipping rebind", deviceName)
+			continue
+		}
+
+		log.Printf("Rebinding 9p driver for device %s", deviceName)
+
+		// Unbind the driver
+		unbindPath := filepath.Join(driverPath, "unbind")
+		if err := os.WriteFile(unbindPath, []byte(deviceName), 0200); err != nil {
+			log.Printf("Failed to unbind %s: %v", deviceName, err)
+			continue
+		}
+
+		// Small delay to let the unbind complete
+		time.Sleep(50 * time.Millisecond)
+
+		// Rebind the driver
+		bindPath := filepath.Join(driverPath, "bind")
+		if err := os.WriteFile(bindPath, []byte(deviceName), 0200); err != nil {
+			log.Printf("Failed to rebind %s: %v", deviceName, err)
+			continue
+		}
+
+		log.Printf("Successfully rebound 9p driver for %s", deviceName)
+	}
+
+	// Give devices time to reinitialize
+	time.Sleep(100 * time.Millisecond)
+	return nil
+}
+
 func doInit() error {
 	os.Setenv("PATH", "/bin:/sbin:/usr/bin:/usr/sbin:/usr/local/bin")
 	os.Setenv("HOME", "/root")
@@ -85,7 +168,7 @@ func doInit() error {
 				return err
 			}
 			log.Printf("mounting %q to %q\n", tag, dst)
-			if err := syscall.Mount(tag, dst, "9p", 0, "trans=virtio,version=9p2000.L,msize=8192"); err != nil {
+			if err := syscall.Mount(tag, dst, "9p", 0, "trans=virtio,version=9p2000.L,msize=524288"); err != nil {
 				log.Printf("failed mounting %q: %v\n", tag, err)
 				break
 			}
@@ -162,15 +245,22 @@ func doInit() error {
 		if os.Getenv("SNAPSHOT_MODE") == "1" {
 			time.Sleep(time.Second)
 		}
+		// Try to rebind 9p drivers first (helps after snapshot restore)
+		// This resets the virtio-9p backend state that may be stale from build time
+		if err := rebind9pDrivers(); err != nil {
+			log.Printf("9p driver rebind skipped: %v", err)
+		}
+
+		log.Printf("Starting 9p mount loop for %s -> %s\n", packFSTag, packFSDst)
 		mountAttempt := 0
 		maxMountAttempts := 30 // Up to 30 attempts with 100ms sleep = 3 seconds max
 		mounted9p := false
 		for mountAttempt < maxMountAttempts {
 			mountAttempt++
-			if err := syscall.Mount(packFSTag, packFSDst, "9p", 0, "trans=virtio,version=9p2000.L"); err != nil {
+			if err := syscall.Mount(packFSTag, packFSDst, "9p", 0, "trans=virtio,version=9p2000.L,msize=524288"); err != nil {
 				// Log mount errors periodically to help debug
 				if mountAttempt == 1 || mountAttempt%10 == 0 {
-					fmt.Printf("\n9p mount attempt %d failed: %v\n", mountAttempt, err)
+					log.Printf("9p mount attempt %d failed: %v", mountAttempt, err)
 				}
 				time.Sleep(100 * time.Millisecond) // Only sleep after failure
 				continue
@@ -190,6 +280,7 @@ func doInit() error {
 		}
 		///////////////////////////////////////////////////////////////////////
 
+		log.Printf("mounted9p=%v", mounted9p)
 		if mounted9p {
 			// WASI-related filesystems
 			for _, tag := range []string{rootFSTag, packFSTag} {
@@ -197,11 +288,12 @@ func doInit() error {
 				if err := os.Mkdir(dst, 0777); err != nil && !os.IsExist(err) {
 					return err
 				}
-				log.Printf("mounting %q to %q\n", tag, dst)
-				if err := syscall.Mount(tag, dst, "9p", 0, "trans=virtio,version=9p2000.L"); err != nil {
-					log.Printf("failed mounting %q: %v\n", tag, err)
+				log.Printf("Final mount %q -> %q", tag, dst)
+				if err := syscall.Mount(tag, dst, "9p", 0, "trans=virtio,version=9p2000.L,msize=524288"); err != nil {
+					log.Printf("Failed final mount %q: %v", tag, err)
 					break
 				}
+				log.Printf("Mounted %q successfully", tag)
 			}
 
 			infoD, err := os.ReadFile(filepath.Join("/mnt", packFSTag, "info"))
@@ -502,6 +594,18 @@ func parseInfo(infoD []byte) (info runtimeFlags) {
 
 func patchSpec(s runtimespec.Spec, info runtimeFlags, imageConfig imagespec.Image) runtimespec.Spec {
 	s.Mounts = append(s.Mounts, info.mounts...)
+	// Add 9p mount points as bind mounts so container can access browser filesystem
+	// These are mounted by init in the host namespace
+	for _, path := range []string{"/mnt/wasi0", "/mnt/wasi1"} {
+		if _, err := os.Stat(path); err == nil {
+			s.Mounts = append(s.Mounts, runtimespec.Mount{
+				Type:        "bind",
+				Source:      path,
+				Destination: path,
+				Options:     []string{"bind", "rw"},
+			})
+		}
+	}
 	s.Process.Env = append(s.Process.Env, info.env...)
 	entrypoint := info.entrypoint
 	if len(entrypoint) == 0 {
