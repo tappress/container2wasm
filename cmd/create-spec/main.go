@@ -377,6 +377,15 @@ func generateSpec(config ocispec.Image, rootfs string) (_ *specs.Spec, err error
 	s.Root = &specs.Root{
 		Path: runtimeRootfsPath,
 	}
+	// Dev-only: surface the OPFS-backed persistent disk inside the container
+	// at /persistent. The host-side mount of /dev/vdb at /run/persistent
+	// happens in CmdPreRun before runc runs.
+	s.Mounts = append(s.Mounts, specs.Mount{
+		Type:        "bind",
+		Source:      "/run/persistent",
+		Destination: "/persistent",
+		Options:     []string{"rbind", "rw"},
+	})
 	// TODO: ports
 	return s, nil
 }
@@ -392,6 +401,27 @@ func generateBootConfig(debug, debugInit bool, imageConfigPath, runtimeConfigPat
 			{"vmtouch", "-tv", "/sbin/runc", "/sbin/init"},
 		}
 	}
+	// Dev-only persistent disk backed by OPFS virtio-blk. The initial rootfs
+	// (/dev included) is a read-only ISO at this point, so we mknod into
+	// /tmp (a tmpfs already mounted by mountAll) rather than /dev. mount(2)
+	// identifies the device by st_rdev, not the path.
+	// First boot: format ext2. Subsequent boots: skip if already formatted.
+	cmdPreRun = append(cmdPreRun,
+		[]string{"sh", "-c",
+			"set -ex; " +
+				"line=$(awk '$4==\"vdb\"' /proc/partitions); " +
+				"maj=$(echo \"$line\" | awk '{print $1}'); " +
+				"min=$(echo \"$line\" | awk '{print $2}'); " +
+				"if [ -z \"$maj\" ]; then echo 'vdb not in /proc/partitions, skipping persistent disk'; exit 0; fi; " +
+				"DEV=/tmp/c2w-vdb; " +
+				"mknod $DEV b $maj $min; " +
+				"if ! blkid $DEV 2>/dev/null | grep -qi ext; then " +
+				"  echo 'formatting persistent disk as ext2'; mkfs.ext2 -F $DEV; " +
+				"fi; " +
+				"mkdir -p /run/persistent; " +
+				"mount $DEV /run/persistent; " +
+				"echo 'mounted persistent disk at /run/persistent'"},
+	)
 	bootConfig := &inittype.BootConfig{
 		Debug:     debug,
 		DebugInit: debugInit,
