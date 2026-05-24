@@ -409,6 +409,7 @@ func generateBootConfig(debug, debugInit bool, imageConfigPath, runtimeConfigPat
 	cmdPreRun = append(cmdPreRun,
 		[]string{"sh", "-c",
 			"set -ex; " +
+				"mkdir -p /run/persistent; " + // always exists so the OCI bind mount has a source
 				"line=$(awk '$4==\"vdb\"' /proc/partitions); " +
 				"maj=$(echo \"$line\" | awk '{print $1}'); " +
 				"min=$(echo \"$line\" | awk '{print $2}'); " +
@@ -418,7 +419,6 @@ func generateBootConfig(debug, debugInit bool, imageConfigPath, runtimeConfigPat
 				"if ! blkid $DEV 2>/dev/null | grep -qi ext; then " +
 				"  echo 'formatting persistent disk as ext2'; mkfs.ext2 -F $DEV; " +
 				"fi; " +
-				"mkdir -p /run/persistent; " +
 				"mount $DEV /run/persistent; " +
 				"echo 'mounted persistent disk at /run/persistent'"},
 	)
