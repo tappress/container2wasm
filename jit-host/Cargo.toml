@@ -1,0 +1,13 @@
+[package]
+name = "jit-host"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+anyhow = "1"
+wasmtime = "45"
+wasmtime-wasi = "45"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
