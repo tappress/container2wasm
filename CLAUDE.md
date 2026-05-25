@@ -353,3 +353,32 @@ wasmtime run \
 #### Batch 2 prep
 
 Batch 2 ("ALU-only codegen, 2× on synthetic loop") requires **dynamic** wasm module construction at runtime — `--preload` of static modules won't suffice once we want PC-keyed runtime-compiled blocks. Need a host embedder. Per plan: Rust + wasmtime crate. Install rustup before starting Batch 2 work. Tooling decision: write the embedder as a thin host that loads the c2w wasm, provides the `jit.*` imports, and exposes a `register_block(pc, wasm_bytes, len)` host fn callable from inside c2w (so the interpreter can submit codegen results back to the host's block table).
+
+#### Batch 2 result (2026-05-25): 1.25× on Node arithmetic loop — between bail (<1.2×) and success (≥2×)
+
+End-to-end pipeline works. Pure ALU coverage compiles + executes correctly across the full Node startup and a tight `for(let i=0;i<1e8;i++) s+=i*7&255` loop.
+
+Wallclock medians, 3 runs each (Ryzen 9 7000, wasmtime via [jit-host](jit-host/) embedder):
+
+| Variant | What it does | Median | Δ vs jit2 |
+|---|---|---|---|
+| jit2 — Batch 1 dispatch_indirect, no scanner | every BB → dispatch miss → fall through to interpreter | 114 s | — |
+| jit3 — Batch 2 (AUIPC disabled, see below) | first-miss scan, ALU runs compiled, dispatch hits = 285M (16.5%) | 91 s | **1.25×** |
+
+Coverage ceiling for ALU-only is small: only ~8% of executed insns end up inside a compiled block (each block averages ~3 ops before the scanner hits a non-ALU and stops). Runs of pure ALU between branches in V8-emitted RV64 are 2-4 insns; this caps Batch 2's reach. To clear the 2× success bar will need Batch 3 (branches+jumps; should jump coverage well above 50%).
+
+**AUIPC stays disabled.** Enabling it correctly compiles + executes — under wasmtime cranelift — until somewhere ~300 compiled blocks in, when Node corrupts and exits silently. Bisected to the block at pc=0x4d984; that block in isolation is also fine. Strongest theory: code-invalidation we don't yet handle (FENCE.I / SATP-switch with a stale baked PC value in a compiled block). PIC-pattern AUIPC blocks are particularly exposed because their value is PC-dependent — non-AUIPC ops produce PC-independent results that survive most invalidation classes. Plan Q3 ("MMU/code invalidation: bump a generation counter on SATP write, FENCE.I, ... compiled blocks check generation at entry") is the right fix; postponed to before Batch 4 lands (loads/stores would magnify the same exposure).
+
+**Bug fixes uncovered during Batch 2 (committed)**:
+- riscv_cpu_template.h JIT hook now resets `code_ptr = NULL; code_end = NULL;` after a compiled-block return, so the interpreter re-walks the TLB instead of mis-decoding from the previous block's page bytes. Without this, only the very first compiled block worked.
+- jit-host injects `--no-stdin` as guest arg 0. wasmtime CLI repro had this; without it, c2w's `poll_oneoff` on a non-TTY host stdin returns EINVAL and the kernel exits before runc launches the container command. This was hidden in earlier Batch 1 tests because no node script was actually being executed (no failure → no signal).
+- dispatch_indirect avoids `func.typed::<i32, i64>()` on every call (caches `TypedFunc` at register_block time). Per-dispatch overhead from ~50ns → ~5ns; the timing was masking the speedup signal.
+
+**What committed where**:
+- tinyemu-c2w `97c8f0c` — jit_codegen.c (scanner+IR), scanner hook in template, jit_interface.h adds register_block/mark_uncompilable, Makefile picks up jit_codegen.o.
+- container2wasm `7e6fc69` — jit-host codegen.rs/ir.rs, register_block + TypedFunc-cached dispatch_indirect, Dockerfile.local adds jit_codegen.o to EMU_OBJS.
+
+**Next step decision**: at 1.25× we're past bail but short of success. Two paths:
+1. Push to Batch 3 (branches+jumps). Likely takes us well past 2× because branch-bound BBs become single compiled blocks instead of 5-10 dispatch-miss interpreter trips.
+2. Implement Q3 invalidation first, re-enable AUIPC. Smaller incremental win (probably to ~1.4-1.5×) and lays the foundation for Batch 4 (loads/stores) where invalidation hygiene matters more.
+Default plan: do (1) next, fold (2) in before Batch 4.
