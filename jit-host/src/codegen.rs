@@ -11,27 +11,101 @@
 //!
 //! IR is a flat byte stream from the C scanner. See [crate::ir].
 
-use crate::ir::{Op, parse_ir};
+use crate::ir::{LoadW, Op, StoreW, parse_ir};
 use wasm_encoder::*;
+
+/// Guest export names of the memory helpers, indexed by helper id (loads
+/// 0-6 = lb/lh/lw/ld/lbu/lhu/lwu, stores 7-10 = sb/sh/sw/sd). main.rs
+/// resolves these from the c2w instance and passes them as block imports
+/// positionally, so the order here is load-bearing.
+pub const MEM_HELPER_EXPORTS: [&str; 11] = [
+    "c2w_jit_lb",
+    "c2w_jit_lh",
+    "c2w_jit_lw",
+    "c2w_jit_ld",
+    "c2w_jit_lbu",
+    "c2w_jit_lhu",
+    "c2w_jit_lwu",
+    "c2w_jit_sb",
+    "c2w_jit_sh",
+    "c2w_jit_sw",
+    "c2w_jit_sd",
+];
+
+/// Helper-import identity of a memory op, or None for non-memory ops.
+fn helper_id(op: &Op) -> Option<usize> {
+    match *op {
+        Op::Load { w, .. } => Some(match w {
+            LoadW::B => 0,
+            LoadW::H => 1,
+            LoadW::W => 2,
+            LoadW::D => 3,
+            LoadW::Bu => 4,
+            LoadW::Hu => 5,
+            LoadW::Wu => 6,
+        }),
+        Op::Store { w, .. } => Some(match w {
+            StoreW::B => 7,
+            StoreW::H => 8,
+            StoreW::W => 9,
+            StoreW::D => 10,
+        }),
+        _ => None,
+    }
+}
+
+/// Per-block codegen context: constants baked into emitted code plus the
+/// mapping from helper id to this module's function-import index.
+struct Ctx {
+    start_pc: u64,
+    block_end_pc: u64,
+    helper_import_idx: [Option<u32>; 11],
+}
 
 /// Build a wasm module containing one exported function "block" with signature
 /// `(state_ptr: i32) -> (next_pc: i64)` implementing the given IR sequence.
 ///
-/// `block_end_pc` is the absolute guest PC at which the compiled run ends
-/// (i.e. PC of the first non-ALU insn). The compiled block stores this into
-/// `s->pc` via the host-imported state pointer and returns it.
-pub fn build_block(ir: &[u8], block_end_pc: u64) -> Vec<u8> {
+/// `start_pc` is the block's first guest PC — memory ops bake
+/// `start_pc + pc_off` as their tagged fault-return value, so the content
+/// cache must key on it. `block_end_pc` is the absolute guest PC at which the
+/// compiled run ends.
+///
+/// Returns the module bytes plus the helper ids the block imports, in import
+/// order — the caller must pass exactly those guest funcs (after the memory)
+/// to instantiation.
+pub fn build_block(ir: &[u8], start_pc: u64, block_end_pc: u64) -> (Vec<u8>, Vec<usize>) {
     let ops = parse_ir(ir);
+
+    // Which memory helpers does this block use? Imports are declared only
+    // for those (ascending helper id), so pure ALU/branch blocks keep the
+    // old single-memory-import shape and work against guests that don't
+    // export the helpers.
+    let mut used: Vec<usize> = ops.iter().filter_map(helper_id).collect();
+    used.sort_unstable();
+    used.dedup();
+    let mut helper_import_idx = [None; 11];
+    for (i, &h) in used.iter().enumerate() {
+        helper_import_idx[h] = Some(i as u32);
+    }
 
     let mut module = Module::new();
 
-    // Types: one function type (i32) -> (i64).
+    // Types: 0 = block (i32)->(i64), 1 = load helper (state, addr, rd_off)
+    // -> fault, 2 = store helper (state, addr, val) -> fault. 1 and 2 are
+    // emitted unconditionally so indices stay fixed.
     let mut types = TypeSection::new();
     types.ty().function(vec![ValType::I32], vec![ValType::I64]);
+    types
+        .ty()
+        .function(vec![ValType::I32, ValType::I64, ValType::I32], vec![ValType::I32]);
+    types
+        .ty()
+        .function(vec![ValType::I32, ValType::I64, ValType::I64], vec![ValType::I32]);
     module.section(&types);
 
     // Imports: guest.mem (we don't actually need any min pages; the host
-    // overrides with the real guest memory at instantiate time).
+    // overrides with the real guest memory at instantiate time), then the
+    // used memory helpers as function imports 0..n-1.
     let mut imports = ImportSection::new();
     imports.import(
         "guest",
@@ -44,24 +118,36 @@ pub fn build_block(ir: &[u8], block_end_pc: u64) -> Vec<u8> {
             page_size_log2: None,
         }),
     );
+    for &h in &used {
+        let ty = if h < 7 { 1 } else { 2 };
+        imports.import("guest", MEM_HELPER_EXPORTS[h], EntityType::Function(ty));
+    }
     module.section(&imports);
 
-    // Functions: one local function, type index 0.
+    // Functions: one local function, type index 0. Its function index comes
+    // after the imported helpers.
+    let block_func_idx = used.len() as u32;
     let mut funcs = FunctionSection::new();
     funcs.function(0);
     module.section(&funcs);
 
-    // Exports: "block" -> function 0.
+    // Exports: "block" -> the local function.
     let mut exports = ExportSection::new();
-    exports.export("block", ExportKind::Func, 0);
+    exports.export("block", ExportKind::Func, block_func_idx);
     module.section(&exports);
+
+    let ctx = Ctx {
+        start_pc,
+        block_end_pc,
+        helper_import_idx,
+    };
 
     // Code. One i64 local (idx 1) used by JALR codegen to stash new_pc before
     // performing the link-register write (avoids rs1 == rd hazard).
     let mut codes = CodeSection::new();
     let mut f = Function::new(vec![(1, ValType::I64)]);
     let ends_with_terminator = ops.last().map(Op::is_terminator).unwrap_or(false);
-    emit_ops(&mut f, &ops, block_end_pc);
+    emit_ops(&mut f, &ops, &ctx);
     // Non-terminator block: fall through to the static end-PC constant.
     // Terminator block: the last op already left next_pc on the stack.
     if !ends_with_terminator {
@@ -71,19 +157,20 @@ pub fn build_block(ir: &[u8], block_end_pc: u64) -> Vec<u8> {
     codes.function(&f);
     module.section(&codes);
 
-    module.finish()
+    (module.finish(), used)
 }
 
 /// Translate one IR op to wasm instructions. All ops follow the pattern
 /// `(load rs1?) (load rs2_or_imm) (compute) (store rd)`. Writes to x0
 /// (reg_off == 0) are discarded by the C scanner before reaching here.
-fn emit_ops(f: &mut Function, ops: &[Op], block_end_pc: u64) {
+fn emit_ops(f: &mut Function, ops: &[Op], ctx: &Ctx) {
     for op in ops {
-        emit_one(f, op, block_end_pc);
+        emit_one(f, op, ctx);
     }
 }
 
-fn emit_one(f: &mut Function, op: &Op, block_end_pc: u64) {
+fn emit_one(f: &mut Function, op: &Op, ctx: &Ctx) {
+    let block_end_pc = ctx.block_end_pc;
     use Op::*;
     match *op {
         // rd = imm (LUI, LI)
@@ -307,7 +394,45 @@ fn emit_one(f: &mut Function, op: &Op, block_end_pc: u64) {
         Bge { rs1, rs2, target_pc } => branch(f, rs1, rs2, target_pc, block_end_pc, &Instruction::I64GeS),
         Bltu { rs1, rs2, target_pc } => branch(f, rs1, rs2, target_pc, block_end_pc, &Instruction::I64LtU),
         Bgeu { rs1, rs2, target_pc } => branch(f, rs1, rs2, target_pc, block_end_pc, &Instruction::I64GeU),
+
+        // Memory ops: call the imported guest helper, which performs the
+        // access (TLB fast path inline in the guest module) including rd
+        // writeback for loads. Helper returns nonzero on MMU fault — the
+        // block then bails with the faulting insn's pc, tagged with bit 0 so
+        // the interpreter re-executes that insn and raises the exception.
+        Load { w: _, rd, rs1, imm, pc_off } => {
+            f.instruction(&Instruction::LocalGet(0)); // state
+            load_reg(f, rs1);
+            f.instruction(&Instruction::I64Const(imm));
+            f.instruction(&Instruction::I64Add); // addr
+            f.instruction(&Instruction::I32Const(rd as i32)); // rd_off, 0 = x0
+            f.instruction(&Instruction::Call(
+                ctx.helper_import_idx[helper_id(op).unwrap()].unwrap(),
+            ));
+            fault_check(f, ctx.start_pc + pc_off as u64);
+        }
+        Store { w: _, rs1, rs2, imm, pc_off } => {
+            f.instruction(&Instruction::LocalGet(0)); // state
+            load_reg(f, rs1);
+            f.instruction(&Instruction::I64Const(imm));
+            f.instruction(&Instruction::I64Add); // addr
+            load_reg(f, rs2); // val
+            f.instruction(&Instruction::Call(
+                ctx.helper_import_idx[helper_id(op).unwrap()].unwrap(),
+            ));
+            fault_check(f, ctx.start_pc + pc_off as u64);
+        }
     }
+}
+
+/// Emit the post-helper fault check: nonzero return = MMU fault; bail out of
+/// the block returning the faulting insn's pc with bit 0 set (real pcs are
+/// even, so the tag is unambiguous to the dispatch hook).
+fn fault_check(f: &mut Function, fault_pc: u64) {
+    f.instruction(&Instruction::If(BlockType::Empty));
+    f.instruction(&Instruction::I64Const((fault_pc | 1) as i64));
+    f.instruction(&Instruction::Return);
+    f.instruction(&Instruction::End);
 }
 
 /// Conditional branch terminator. Emits explicit if/else producing target_pc

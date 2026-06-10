@@ -432,3 +432,27 @@ All outputs correct, `reg_fail=0`, and `dispatch_hit/miss=0` on the host — the
 **Decisions locked by this batch**: dispatch architecture is final (in-wasm, host only at registration/flush — also the right shape for the browser port where the host is JS). Invalidation is final (gen counters, content-cache reuse). Q1 (compile-burst latency) answered: hotness gate, not module batching, was the first-order fix; batching remains a second-order lever.
 
 **Next**: Batch 4 (loads/stores via slow-path calls into `target_read_*`/`target_write_*`), re-measure echo hi gate after; then inline TLB (Batch 5), RV-C (Batch 7) — order per original plan.
+
+#### Batch 4 result (2026-06-10): loads/stores land — first config to beat Batch 3.5 on every workload; scan-gate default rebalanced to 128
+
+**Design as built** (tinyemu-c2w `9a6b734`, container2wasm this commit):
+- Scanner emits 11 new IR kinds (LB/LH/LW/LD/LBU/LHU/LWU/SB/SH/SW/SD, kinds 38-48); loads/stores are non-terminators, so blocks now run through memory traffic instead of dying at the first load. Load-to-x0 still performs the access (rd_off=0 sentinel skips writeback); stores excluded from the rd==0 short-circuit (their rd field is imm bits).
+- c2w exports `c2w_jit_lb`..`c2w_jit_sd` (full insn semantics: inline TLB-probed `target_read_u*`/`target_write_u*` fast path, sign/zero extension, rd writeback). The host resolves them into each block module's **function imports at instantiation**, so a guest load/store is a wasm→wasm call — the host boundary is never crossed, same principle as v4 dispatch. Blocks declare only the helpers they use (pure-ALU blocks keep the old shape; old artifacts still work under the new jit-host).
+- **MMU-fault convention**: helper returns 1 (pending_exception/tval already set by the slow path); the block bails returning `fault_pc | 1` (real pcs are even ⇒ bit-0 tag is unambiguous). The dispatch hook unmasks, sets `s->pc = fault_pc`, resyncs `code_ptr/code_to_pc_addend` (so GET_PC() stays right even if the *fetch* then faults), and falls through — the interpreter re-executes the faulting insn and raises with correct epc/tval. No new exception plumbing; re-execution is architecturally equivalent to RISC-V fault-restart semantics. Per-insn fault pcs ride in the unused IR field (loads: rs2_off, stores: rd_off, as byte offset from block start); since codegen now bakes `start_pc + off`, the content-cache key gained start_pc.
+- Semantic tests: [jit-host/tests/mem_ops.rs](jit-host/tests/mem_ops.rs) (arg derivation, import wiring, fault tag + skip-rest-of-block).
+
+**The forced rebalance**: mem coverage made ~3× more pcs compilable, and at gate=16 cranelift swamped short workloads (echo hi 5.18s — worse than Batch 3.5's 3.04; hello compile_ms 1.7→5.25s). Threshold A/B (16/64/128, 3-run medians) showed 128 dominating on all three workloads, so 128 is the new default (`jit_interface.h` + Dockerfile ARG):
+
+| Workload | interp | Batch 3.5 (g16) | B4 g16 | B4 g64 | **B4 g128** |
+|---|---|---|---|---|---|
+| 1e8 arith loop | 114s | 75.5s | 71.8s | 68.4s | **67.2s (1.70×)** |
+| node hello | 12.5s | 14.8s | 15.4s | 13.87s | **13.38s** |
+| busybox echo hi | 1.57s | 3.04s | 5.18s | 3.57s | **2.82s** |
+
+All outputs correct, `reg_fail=0`. Bail criterion (slow-path call overhead regressing perf below Batch 3) **not hit** — execution-side time improved everywhere; the only regression channel was compile volume, fixed by the gate.
+
+**Coverage reality check** (working-tree op-counter diagnostics, insns interpreted vs total): on 1e8, ~30% of executed insns now run inside compiled blocks (43% of block entries are dispatch hits). On echo hi only ~5% — **by design**: the gate refuses once-through boot code, and echo is nearly all boot. The original Batch 4 bar ("coverage >80% on echo hi") predates the scan-gate and is intentionally unmeetable now; the meaningful gates going forward are hot-path coverage + wallclock. The carried "≥1.5× on echo hi" gate stays unmet (0.56×) — echo is bounded by ~0.85s of residual compile + miss-path overhead on never-compiled boot code.
+
+**What blocks coverage now**: RV-C. ~30% of executed insns are compressed and every one terminates a scan, so average compiled-block length stays ~3-4 insns and the interpreted 70% on 1e8 is heavily compressed-insn-bound. Also still terminating: MUL/DIV, atomics (LR/SC/AMO), FP, CSR ops.
+
+**Next (proposed reorder)**: RV-C (Batch 7) before inline TLB (Batch 5) — coverage is the bigger lever than per-access cost on current data, and longer blocks also raise the value of register lifting (Batch 6). Residual cranelift cost levers if short-workload latency matters sooner: BB-batching per module, async/background compile off the guest's critical path.

@@ -36,16 +36,22 @@ struct HostState {
     /// by host-side dispatch (variants <= 3); on wasm-dispatch builds it
     /// holds just the uncompilable sentinels.
     blocks: HashMap<u64, Option<TypedFunc<i32, i64>>>,
-    /// Content-addressed cache: (end_pc, ir_bytes) -> compiled block. Survives
-    /// flushes — a flush only drops pc->block mappings; re-registration after
-    /// a rescan re-links from here without recompiling or re-instantiating.
-    /// Staleness-immune by construction: the scanner always reads current
-    /// guest bytes, so changed code produces a different key. Also keeps the
-    /// store's instance count bounded by unique block content (wasmtime caps
-    /// instances per store at ~10k).
-    module_cache: HashMap<(u64, Vec<u8>), CachedBlock>,
+    /// Content-addressed cache: (start_pc, end_pc, ir_bytes) -> compiled
+    /// block. Survives flushes — a flush only drops pc->block mappings;
+    /// re-registration after a rescan re-links from here without recompiling
+    /// or re-instantiating. Staleness-immune by construction: the scanner
+    /// always reads current guest bytes, so changed code produces a different
+    /// key. start_pc is part of the key because memory ops bake absolute
+    /// fault pcs derived from it. Also keeps the store's instance count
+    /// bounded by unique block content (wasmtime caps instances per store at
+    /// ~10k by default).
+    module_cache: HashMap<(u64, u64, Vec<u8>), CachedBlock>,
     /// Cached handle to the guest module's exported linear memory.
     guest_memory: Option<Memory>,
+    /// Memory helpers exported by the guest (c2w_jit_lb..sd, indexed by
+    /// helper id — see codegen::MEM_HELPER_EXPORTS). Present on Batch 4+
+    /// builds; blocks containing loads/stores import them at instantiation.
+    mem_helpers: Option<Vec<Func>>,
     /// The guest module's exported funcref table (`-Wl,--export-table`).
     /// Present = wasm-side dispatch: register_block grows this table with the
     /// compiled block's Func and returns the slot index; the guest then calls
@@ -294,6 +300,7 @@ fn main() -> Result<()> {
             .instances(1_000_000)
             .build(),
         guest_memory: None,
+        mem_helpers: None,
         guest_table: None,
         n_register_ok: 0,
         n_register_fail: 0,
@@ -323,6 +330,16 @@ fn main() -> Result<()> {
             "[jit-host] guest exports its funcref table (size {}): wasm-side dispatch",
             table.size(&store)
         );
+    }
+    // Memory helpers (Batch 4+ builds): all 11 or none. Without them, blocks
+    // containing loads/stores fail registration and fall back to interpreting.
+    let helpers: Option<Vec<Func>> = codegen::MEM_HELPER_EXPORTS
+        .iter()
+        .map(|n| instance.get_func(&mut store, n))
+        .collect();
+    if let Some(h) = helpers {
+        store.data_mut().mem_helpers = Some(h);
+        eprintln!("[jit-host] guest exports mem helpers: load/store codegen enabled");
     }
     let start = instance.get_typed_func::<(), ()>(&mut store, "_start")?;
     let run_result = start.call(&mut store, ());
@@ -388,9 +405,10 @@ fn register_block_inner(
     }
     let ir_bytes = data[start..end].to_vec();
 
-    // Debugging: env-var filters to reject specific terminator classes.
+    // Debugging: env-var filters to reject specific op classes.
     // JIT_NO_BRANCH=1   skips blocks whose last op is a conditional branch.
     // JIT_NO_JUMP=1     skips blocks whose last op is JAL/JALR.
+    // JIT_NO_MEM=1      skips blocks containing any load/store.
     if !ir_bytes.is_empty() {
         let last_kind = ir_bytes[ir_bytes.len() - 16];
         if std::env::var_os("JIT_NO_BRANCH").is_some() && (32..=37).contains(&last_kind) {
@@ -398,6 +416,11 @@ fn register_block_inner(
         }
         if std::env::var_os("JIT_NO_JUMP").is_some() && (last_kind == 30 || last_kind == 31) {
             return Err(Error::msg("JIT_NO_JUMP: skipping jump terminator"));
+        }
+        if std::env::var_os("JIT_NO_MEM").is_some()
+            && ir_bytes.chunks_exact(16).any(|c| (38..=48).contains(&c[0]))
+        {
+            return Err(Error::msg("JIT_NO_MEM: skipping block with memory ops"));
         }
     }
 
@@ -420,9 +443,10 @@ fn register_block_inner(
     } else {
         ir_bytes
     };
-    // Content-cache hit: same IR bytes + same end_pc produce byte-identical
-    // wasm, so reuse the existing instance instead of recompiling.
-    let cache_key = (end_pc, ir_bytes.clone());
+    // Content-cache hit: same IR bytes + same start/end pc produce
+    // byte-identical wasm, so reuse the existing instance instead of
+    // recompiling.
+    let cache_key = (pc, end_pc, ir_bytes.clone());
     if let Some(cb) = caller.data().module_cache.get(&cache_key) {
         let cb = cb.clone();
         let st = caller.data_mut();
@@ -437,7 +461,7 @@ fn register_block_inner(
             }
         });
     }
-    let bytes = codegen::build_block(&ir_bytes, end_pc);
+    let (bytes, used_helpers) = codegen::build_block(&ir_bytes, pc, end_pc);
     // JIT_DUMP_PCS=11eb0,ffffffff8002561a,... — dump IR+wasm for specific PCs
     // (hex, no 0x prefix needed) at registration time.
     if let Ok(pcs_str) = std::env::var("JIT_DUMP_PCS") {
@@ -473,7 +497,19 @@ fn register_block_inner(
     }
     let engine = caller.engine().clone();
     let module = Module::from_binary(&engine, &bytes)?;
-    let inst = Instance::new(&mut *caller, &module, &[Extern::Memory(mem)])?;
+    // Imports are positional: guest memory first, then the helpers the block
+    // uses, in the order build_block declared them.
+    let externs: Vec<Extern> = {
+        let mut v = vec![Extern::Memory(mem)];
+        if !used_helpers.is_empty() {
+            let helpers = caller.data().mem_helpers.as_ref().ok_or_else(|| {
+                Error::msg("block uses memory ops but guest exports no c2w_jit_* helpers")
+            })?;
+            v.extend(used_helpers.iter().map(|&h| Extern::Func(helpers[h])));
+        }
+        v
+    };
+    let inst = Instance::new(&mut *caller, &module, &externs)?;
     let typed = inst
         .get_typed_func::<i32, i64>(&mut *caller, "block")
         .map_err(|e| Error::msg(format!("compiled module typed-func error: {e}")))?;

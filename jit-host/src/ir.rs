@@ -61,6 +61,42 @@ pub enum OpKind {
     Bge = 35,
     Bltu = 36,
     Bgeu = 37,
+    // Memory ops (Batch 4). Non-terminators; compile to calls into the
+    // guest-exported c2w_jit_* helpers. Field reuse for the fault pc: loads
+    // carry the insn's byte offset from block start in rs2_off, stores carry
+    // it in rd_off (stores have no rd; loads no rs2).
+    Lb = 38,    // rd_off (0 = x0), rs1_off = base, rs2_off = pc_off, imm = disp
+    Lh = 39,
+    Lw = 40,
+    Ld = 41,
+    Lbu = 42,
+    Lhu = 43,
+    Lwu = 44,
+    Sb = 45,    // rd_off = pc_off, rs1_off = base, rs2_off = src, imm = disp
+    Sh = 46,
+    Sw = 47,
+    Sd = 48,
+}
+
+/// Load width + extension; doubles as the helper-import identity.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LoadW {
+    B,
+    H,
+    W,
+    D,
+    Bu,
+    Hu,
+    Wu,
+}
+
+/// Store width; doubles as the helper-import identity.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StoreW {
+    B,
+    H,
+    W,
+    D,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -104,6 +140,10 @@ pub enum Op {
     Bge { rs1: u32, rs2: u32, target_pc: i64 },
     Bltu { rs1: u32, rs2: u32, target_pc: i64 },
     Bgeu { rs1: u32, rs2: u32, target_pc: i64 },
+    // Memory ops. pc_off = faulting insn's byte offset from block start;
+    // codegen bakes start_pc + pc_off as the tagged fault-return pc.
+    Load { w: LoadW, rd: u32, rs1: u32, imm: i64, pc_off: u32 },
+    Store { w: StoreW, rs1: u32, rs2: u32, imm: i64, pc_off: u32 },
 }
 
 impl Op {
@@ -175,6 +215,17 @@ pub fn parse_ir(bytes: &[u8]) -> Vec<Op> {
             x if x == OpKind::Bge as u8 => Op::Bge { rs1, rs2, target_pc: imm },
             x if x == OpKind::Bltu as u8 => Op::Bltu { rs1, rs2, target_pc: imm },
             x if x == OpKind::Bgeu as u8 => Op::Bgeu { rs1, rs2, target_pc: imm },
+            x if x == OpKind::Lb as u8 => Op::Load { w: LoadW::B, rd, rs1, imm, pc_off: rs2 },
+            x if x == OpKind::Lh as u8 => Op::Load { w: LoadW::H, rd, rs1, imm, pc_off: rs2 },
+            x if x == OpKind::Lw as u8 => Op::Load { w: LoadW::W, rd, rs1, imm, pc_off: rs2 },
+            x if x == OpKind::Ld as u8 => Op::Load { w: LoadW::D, rd, rs1, imm, pc_off: rs2 },
+            x if x == OpKind::Lbu as u8 => Op::Load { w: LoadW::Bu, rd, rs1, imm, pc_off: rs2 },
+            x if x == OpKind::Lhu as u8 => Op::Load { w: LoadW::Hu, rd, rs1, imm, pc_off: rs2 },
+            x if x == OpKind::Lwu as u8 => Op::Load { w: LoadW::Wu, rd, rs1, imm, pc_off: rs2 },
+            x if x == OpKind::Sb as u8 => Op::Store { w: StoreW::B, rs1, rs2, imm, pc_off: rd },
+            x if x == OpKind::Sh as u8 => Op::Store { w: StoreW::H, rs1, rs2, imm, pc_off: rd },
+            x if x == OpKind::Sw as u8 => Op::Store { w: StoreW::W, rs1, rs2, imm, pc_off: rd },
+            x if x == OpKind::Sd as u8 => Op::Store { w: StoreW::D, rs1, rs2, imm, pc_off: rd },
             other => panic!("unknown IR op_kind {}", other),
         };
         ops.push(op);
