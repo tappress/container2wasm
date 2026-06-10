@@ -20,21 +20,37 @@ use wasmtime::*;
 use wasmtime_wasi::WasiCtxBuilder;
 use wasmtime_wasi::p1::WasiP1Ctx;
 
+/// A compiled block in the content cache. `slot` is its index in the guest
+/// module's exported funcref table (wasm-side dispatch builds, variant 4);
+/// `None` on legacy host-dispatch builds (variants <= 3).
+#[derive(Clone)]
+struct CachedBlock {
+    typed: TypedFunc<i32, i64>,
+    slot: Option<u32>,
+}
+
 struct HostState {
     wasi: WasiP1Ctx,
     /// Compiled-block table keyed by guest PC. `Some(Some(_))` = compiled,
-    /// `Some(None)` = "uncompilable" sentinel (don't retry).
+    /// `Some(None)` = "uncompilable" sentinel (don't retry). Only consulted
+    /// by host-side dispatch (variants <= 3); on wasm-dispatch builds it
+    /// holds just the uncompilable sentinels.
     blocks: HashMap<u64, Option<TypedFunc<i32, i64>>>,
-    /// Content-addressed cache: (end_pc, ir_bytes) -> compiled func. Survives
+    /// Content-addressed cache: (end_pc, ir_bytes) -> compiled block. Survives
     /// flushes — a flush only drops pc->block mappings; re-registration after
     /// a rescan re-links from here without recompiling or re-instantiating.
     /// Staleness-immune by construction: the scanner always reads current
     /// guest bytes, so changed code produces a different key. Also keeps the
     /// store's instance count bounded by unique block content (wasmtime caps
     /// instances per store at ~10k).
-    module_cache: HashMap<(u64, Vec<u8>), TypedFunc<i32, i64>>,
+    module_cache: HashMap<(u64, Vec<u8>), CachedBlock>,
     /// Cached handle to the guest module's exported linear memory.
     guest_memory: Option<Memory>,
+    /// The guest module's exported funcref table (`-Wl,--export-table`).
+    /// Present = wasm-side dispatch: register_block grows this table with the
+    /// compiled block's Func and returns the slot index; the guest then calls
+    /// blocks via call_indirect without ever crossing back into the host.
+    guest_table: Option<Table>,
     /// Raises wasmtime's default 10k-instances-per-store cap — every unique
     /// compiled block is an instance, and V8's self-modifying code mints new
     /// unique content continuously, so Node workloads blow past 10k.
@@ -183,18 +199,22 @@ fn main() -> Result<()> {
               ir_ptr: i32,
               ir_len: i32|
               -> i32 {
+            // Failure sentinel differs by dispatch mode: wasm-side dispatch
+            // (guest table exported) treats any value <= 0 as failure, legacy
+            // host dispatch checks != 0.
+            let fail = if caller.data().guest_table.is_some() { -1 } else { 0 };
             if disable_compile
                 || caller.data().n_register_ok >= max_blocks
                 || skip_pcs.contains(&(pc as u64))
             {
                 caller.data_mut().blocks.insert(pc as u64, None);
-                return 0;
+                return fail;
             }
             let t0 = std::time::Instant::now();
             let r = match register_block_inner(&mut caller, pc as u64, end_pc as u64, ir_ptr, ir_len) {
-                Ok(()) => {
+                Ok(ret) => {
                     caller.data_mut().n_register_ok += 1;
-                    1
+                    ret
                 }
                 Err(e) => {
                     if std::env::var_os("JIT_LOG_FAIL").is_some() {
@@ -203,7 +223,7 @@ fn main() -> Result<()> {
                     let st = caller.data_mut();
                     st.blocks.insert(pc as u64, None);
                     st.n_register_fail += 1;
-                    0
+                    fail
                 }
             };
             caller.data_mut().compile_nanos += t0.elapsed().as_nanos() as u64;
@@ -223,6 +243,10 @@ fn main() -> Result<()> {
     // drop to that page (blocks never span pages). kind 2 = fence.i: drop
     // everything. JIT_IGNORE_FLUSH=1 turns this into a counter-only no-op so
     // the same wasm can be A/B-run with invalidation off.
+    //
+    // On wasm-dispatch builds (guest table exported) this is stats-only: the
+    // guest invalidates its own pc->slot map via generation counters, and the
+    // host's `blocks` map isn't consulted for dispatch.
     let ignore_flush = std::env::var_os("JIT_IGNORE_FLUSH").is_some();
     const KERNEL_HALF_BASE: u64 = 0xffff_ffc0_0000_0000;
     const PG_MASK: u64 = 0xfff;
@@ -230,9 +254,10 @@ fn main() -> Result<()> {
         "jit",
         "flush_blocks",
         move |mut caller: Caller<'_, HostState>, kind: i32, addr: i64| {
+            let wasm_dispatch = caller.data().guest_table.is_some();
             let st = caller.data_mut();
             st.n_flush[(kind as usize).min(2)] += 1;
-            if ignore_flush {
+            if ignore_flush || wasm_dispatch {
                 return;
             }
             match kind {
@@ -269,6 +294,7 @@ fn main() -> Result<()> {
             .instances(1_000_000)
             .build(),
         guest_memory: None,
+        guest_table: None,
         n_register_ok: 0,
         n_register_fail: 0,
         n_cache_hit: 0,
@@ -290,6 +316,14 @@ fn main() -> Result<()> {
     if let Some(mem) = instance.get_memory(&mut store, "memory") {
         store.data_mut().guest_memory = Some(mem);
     }
+    // Exported funcref table (-Wl,--export-table) selects wasm-side dispatch.
+    if let Some(table) = instance.get_table(&mut store, "__indirect_function_table") {
+        store.data_mut().guest_table = Some(table);
+        eprintln!(
+            "[jit-host] guest exports its funcref table (size {}): wasm-side dispatch",
+            table.size(&store)
+        );
+    }
     let start = instance.get_typed_func::<(), ()>(&mut store, "_start")?;
     let run_result = start.call(&mut store, ());
     dump_stats(&store);
@@ -306,10 +340,12 @@ fn main() -> Result<()> {
 
 fn dump_stats(store: &Store<HostState>) {
     let st = store.data();
+    let table_size = st.guest_table.map_or(0, |t| t.size(store));
     eprintln!(
-        "[jit-host] stats: blocks={} cache={} reg_ok={} cache_hit={} reg_fail={} dispatch_hit={} dispatch_miss={} flush_satp={} flush_sfence={} flush_fencei={} compile_ms={:.1}",
+        "[jit-host] stats: blocks={} cache={} table={} reg_ok={} cache_hit={} reg_fail={} dispatch_hit={} dispatch_miss={} flush_satp={} flush_sfence={} flush_fencei={} compile_ms={:.1}",
         st.blocks.len(),
         st.module_cache.len(),
+        table_size,
         st.n_register_ok,
         st.n_cache_hit,
         st.n_register_fail,
@@ -328,13 +364,16 @@ fn dump_stats(store: &Store<HostState>) {
     }
 }
 
+/// Compiles + registers one block. Returns the value handed back to the
+/// guest: the funcref-table slot index on wasm-dispatch builds, or 1 on
+/// legacy host-dispatch builds.
 fn register_block_inner(
     caller: &mut Caller<'_, HostState>,
     pc: u64,
     end_pc: u64,
     ir_ptr: i32,
     ir_len: i32,
-) -> Result<()> {
+) -> Result<i32> {
     let mem = caller
         .data()
         .guest_memory
@@ -384,12 +423,19 @@ fn register_block_inner(
     // Content-cache hit: same IR bytes + same end_pc produce byte-identical
     // wasm, so reuse the existing instance instead of recompiling.
     let cache_key = (end_pc, ir_bytes.clone());
-    if let Some(f) = caller.data().module_cache.get(&cache_key) {
-        let f = f.clone();
+    if let Some(cb) = caller.data().module_cache.get(&cache_key) {
+        let cb = cb.clone();
         let st = caller.data_mut();
         st.n_cache_hit += 1;
-        st.blocks.insert(pc, Some(f));
-        return Ok(());
+        return Ok(match cb.slot {
+            // Wasm-side dispatch: the block already sits in the guest table;
+            // the guest re-inserts pc->slot into its own map.
+            Some(slot) => slot as i32,
+            None => {
+                st.blocks.insert(pc, Some(cb.typed));
+                1
+            }
+        });
     }
     let bytes = codegen::build_block(&ir_bytes, end_pc);
     // JIT_DUMP_PCS=11eb0,ffffffff8002561a,... — dump IR+wasm for specific PCs
@@ -431,8 +477,25 @@ fn register_block_inner(
     let typed = inst
         .get_typed_func::<i32, i64>(&mut *caller, "block")
         .map_err(|e| Error::msg(format!("compiled module typed-func error: {e}")))?;
-    let st = caller.data_mut();
-    st.module_cache.insert(cache_key, typed.clone());
-    st.blocks.insert(pc, Some(typed));
-    Ok(())
+    let (ret, slot) = if let Some(table) = caller.data().guest_table {
+        // Wasm-side dispatch: append the block to the guest's funcref table.
+        // grow() returns the previous size, i.e. the new slot's index. The
+        // guest calls it via call_indirect, so the (i32)->(i64) type check
+        // happens there — engine-wide type canonicalization makes the
+        // cross-module Func match.
+        let func = *typed.func();
+        let slot = table
+            .grow(&mut *caller, 1, Ref::Func(Some(func)))
+            .map_err(|e| Error::msg(format!("table.grow failed: {e}")))?;
+        let slot = u32::try_from(slot).map_err(|_| Error::msg("table slot > u32"))?;
+        (slot as i32, Some(slot))
+    } else {
+        caller.data_mut().blocks.insert(pc, Some(typed.clone()));
+        (1, None)
+    };
+    caller
+        .data_mut()
+        .module_cache
+        .insert(cache_key, CachedBlock { typed, slot });
+    Ok(ret)
 }

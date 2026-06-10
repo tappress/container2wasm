@@ -300,6 +300,7 @@ RUN --mount=type=cache,id=tinyemu-ccache-wasi,target=/root/.ccache \
     make -j $(nproc) -f Makefile \
     CONFIG_FS_NET= CONFIG_SDL= CONFIG_INT128= CONFIG_X86EMU= CONFIG_SLIRP= \
     CC="ccache ${WASI_SDK_PATH}/bin/clang --sysroot=${WASI_SDK_PATH}/share/wasi-sysroot -D_WASI_EMULATED_SIGNAL -DWASI -I/tools/wizer/include/ -DJIT_DISPATCH_VARIANT=${JIT_DISPATCH_VARIANT}" \
+    LDFLAGS="-Wl,--export-table -Wl,--growable-table" \
     EMU_LIBS="/tools/wasi-vfs/libwasi_vfs.a -lrt" \
     EMU_OBJS="virtio.o pci.o fs.o cutils.o iomem.o simplefb.o json.o machine.o temu.o wasi.o riscv_machine.o softfp.o riscv_cpu32.o riscv_cpu64.o fs_disk.o block_opfs.o jit_codegen.o"
 

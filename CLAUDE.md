@@ -406,3 +406,29 @@ Output correct in all runs; `reg_fail=0`; hello compiles ~10k unique blocks (~8.
 - Target: restore ~1.4ns-class dispatch (Batch 1's measured number for in-wasm `call_indirect`) so Batch 3's coverage translates into wallclock wins; re-measure 1e8 (expect well under 91s) and busybox echo hi (the formal ≥1.5× gate) before starting loads/stores.
 
 **What committed where**: tinyemu-c2w `bafb2e4` (invalidation hooks, tried-cache global, AUIPC re-enable, n_cycles charge per compiled block), container2wasm — jit-host flush_blocks + content cache + StoreLimits + diagnostics (`JIT_TIMEOUT_SECS`, `JIT_TRACE_DISPATCH`, `JIT_DUMP_PCS`, `JIT_NO_BRANCH`/`JIT_NO_JUMP`, bisect-bad-block.py), lib.rs split + tests/.
+
+#### Batch 3.5 result (2026-06-10): wasm-side dispatch + scan-gate — JIT decisively net-positive for the first time
+
+Implemented exactly the committed design (variant 4, `JIT_DISPATCH_VARIANT=4`), plus one addition the first measurement round forced: a **hotness threshold**. Numbers (3-run medians, Ryzen 9 7000, jit-host):
+
+| Workload | interp | Batch 2 (ALU) | Batch 3 (host dispatch) | v4 dispatch | **v4 + scan-gate** |
+|---|---|---|---|---|---|
+| 1e8 arith loop | 114s | 91s | 161s | 98.6s | **75.5s (1.51× vs interp)** |
+| node hello | 12.5s | ~13s | 21.7s | 20.0s | **14.8s** |
+| busybox echo hi | 1.57s | — | — | 5.5s | **3.04s** |
+
+All outputs correct, `reg_fail=0`, and `dispatch_hit/miss=0` on the host — the boundary is never crossed per block entry. Adversarial review workflow (10 agents, 4 lenses): 0 confirmed findings.
+
+**What was built** (tinyemu-c2w `f6f016e`, container2wasm this commit):
+- **Wasm-side dispatch**: c2w links with `-Wl,--export-table -Wl,--growable-table`; host `table.grow`s each compiled block's `Func` into the c2w module's own table 0 and `register_block` returns the slot index. C keeps a direct-mapped 64K-entry pc→slot map in linear memory; a hit is a plain function-pointer call (`((c2w_bb_fn)(uintptr_t)idx)(s)` = `call_indirect`, cross-module type check passes via wasmtime's engine-wide type canonicalization). Works exactly as Batch 1 predicted.
+- **O(1) lazy invalidation** replacing host-side eager flush: three generation counters (user / global / per-page-hash, 4096 buckets) stamped into each map entry at insert and checked at lookup. satp → user_gen++ (kernel half survives, relies on Linux announcing kernel-text changes via fence.i); targeted sfence.vma → page_gen[hash]++; fence.i / full sfence → global_gen++. No memsets on flush anymore. flush_blocks host import is stats-only now.
+- **Scan-gate (the forced addition)**: first v4 measurement showed echo hi at 5.5s vs 1.57s interp — **3.0s of it cranelift-compiling 5145 blocks of once-through boot code** (hello: 8.9s compiling 10.3k blocks). A JIT cannot win on code that runs once; it must not compile it. Gate: a pc is scanned only after 16 dispatch misses within the current mapping epoch (gen-stamped like the map, so flushes reset counts lazily; previously-hot pcs re-scan immediately after an epoch roll — the host content cache makes that ~µs; failed scans set an uncompilable sentinel until the epoch rolls). Override with `-DJIT_HOT_THRESHOLD=N`. Effect: hello unique compiles 10,292 → 2,120, compile_ms 8.9s → 1.7s; echo hi compile_ms 3.0s → 0.83s.
+
+**Where the remaining gaps are** (why hello is 14.8 not <12.5, echo hi 3.0 not 1.6):
+- ~1.7s/0.8s residual cranelift time — next lever is batching many BBs per module (~0.85ms/module overhead) and/or raising the threshold.
+- ~0.5-0.6s miss-path overhead on once-through code (map + gate lookup per block entry on code that never compiles). Even at zero compile cost echo hi would sit ~2.2s vs 1.57s — **boot-heavy workloads can't beat the interpreter until coverage rises**, i.e. until the kernel's actually-hot paths (memcpy, page ops, scheduler) become compilable. That's Batch 4 (loads/stores) + Batch 7 (RV-C).
+- The formal "≥1.5× on busybox echo hi" Batch 3 gate is therefore **not met and not meetable at current coverage** — the 1.51× gate is met on the hot-loop workload instead. Carrying the gate forward to re-test after Batch 4.
+
+**Decisions locked by this batch**: dispatch architecture is final (in-wasm, host only at registration/flush — also the right shape for the browser port where the host is JS). Invalidation is final (gen counters, content-cache reuse). Q1 (compile-burst latency) answered: hotness gate, not module batching, was the first-order fix; batching remains a second-order lever.
+
+**Next**: Batch 4 (loads/stores via slow-path calls into `target_read_*`/`target_write_*`), re-measure echo hi gate after; then inline TLB (Batch 5), RV-C (Batch 7) — order per original plan.
