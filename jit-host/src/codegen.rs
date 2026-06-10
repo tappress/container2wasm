@@ -56,12 +56,17 @@ pub fn build_block(ir: &[u8], block_end_pc: u64) -> Vec<u8> {
     exports.export("block", ExportKind::Func, 0);
     module.section(&exports);
 
-    // Code.
+    // Code. One i64 local (idx 1) used by JALR codegen to stash new_pc before
+    // performing the link-register write (avoids rs1 == rd hazard).
     let mut codes = CodeSection::new();
-    let mut f = Function::new(vec![]);
-    emit_ops(&mut f, &ops);
-    // Emit the block-exit PC and return.
-    f.instruction(&Instruction::I64Const(block_end_pc as i64));
+    let mut f = Function::new(vec![(1, ValType::I64)]);
+    let ends_with_terminator = ops.last().map(Op::is_terminator).unwrap_or(false);
+    emit_ops(&mut f, &ops, block_end_pc);
+    // Non-terminator block: fall through to the static end-PC constant.
+    // Terminator block: the last op already left next_pc on the stack.
+    if !ends_with_terminator {
+        f.instruction(&Instruction::I64Const(block_end_pc as i64));
+    }
     f.instruction(&Instruction::End);
     codes.function(&f);
     module.section(&codes);
@@ -72,13 +77,13 @@ pub fn build_block(ir: &[u8], block_end_pc: u64) -> Vec<u8> {
 /// Translate one IR op to wasm instructions. All ops follow the pattern
 /// `(load rs1?) (load rs2_or_imm) (compute) (store rd)`. Writes to x0
 /// (reg_off == 0) are discarded by the C scanner before reaching here.
-fn emit_ops(f: &mut Function, ops: &[Op]) {
+fn emit_ops(f: &mut Function, ops: &[Op], block_end_pc: u64) {
     for op in ops {
-        emit_one(f, op);
+        emit_one(f, op, block_end_pc);
     }
 }
 
-fn emit_one(f: &mut Function, op: &Op) {
+fn emit_one(f: &mut Function, op: &Op, block_end_pc: u64) {
     use Op::*;
     match *op {
         // rd = imm (LUI, LI)
@@ -267,7 +272,64 @@ fn emit_one(f: &mut Function, op: &Op) {
             f.instruction(&Instruction::I64ExtendI32S);
             store_reg(f, rd);
         }
+
+        // Terminators. Each leaves `next_pc: i64` on the stack as the
+        // function return value. `block_end_pc` is the PC right after the
+        // terminator insn — used as link_pc for JAL/JALR and as
+        // fallthrough_pc for Bxx.
+        Jal { rd, target_pc } => {
+            if rd != 0 {
+                f.instruction(&Instruction::LocalGet(0));
+                f.instruction(&Instruction::I64Const(block_end_pc as i64));
+                store_reg(f, rd);
+            }
+            f.instruction(&Instruction::I64Const(target_pc));
+        }
+        Jalr { rd, rs1, imm } => {
+            // Compute new_pc = (reg[rs1] + imm) & ~1, stash in local 1 before
+            // writing the link register, in case rd == rs1.
+            load_reg(f, rs1);
+            f.instruction(&Instruction::I64Const(imm));
+            f.instruction(&Instruction::I64Add);
+            f.instruction(&Instruction::I64Const(-2)); // ~1 in i64
+            f.instruction(&Instruction::I64And);
+            f.instruction(&Instruction::LocalSet(1));
+            if rd != 0 {
+                f.instruction(&Instruction::LocalGet(0));
+                f.instruction(&Instruction::I64Const(block_end_pc as i64));
+                store_reg(f, rd);
+            }
+            f.instruction(&Instruction::LocalGet(1));
+        }
+        Beq { rs1, rs2, target_pc } => branch(f, rs1, rs2, target_pc, block_end_pc, &Instruction::I64Eq),
+        Bne { rs1, rs2, target_pc } => branch(f, rs1, rs2, target_pc, block_end_pc, &Instruction::I64Ne),
+        Blt { rs1, rs2, target_pc } => branch(f, rs1, rs2, target_pc, block_end_pc, &Instruction::I64LtS),
+        Bge { rs1, rs2, target_pc } => branch(f, rs1, rs2, target_pc, block_end_pc, &Instruction::I64GeS),
+        Bltu { rs1, rs2, target_pc } => branch(f, rs1, rs2, target_pc, block_end_pc, &Instruction::I64LtU),
+        Bgeu { rs1, rs2, target_pc } => branch(f, rs1, rs2, target_pc, block_end_pc, &Instruction::I64GeU),
     }
+}
+
+/// Conditional branch terminator. Emits explicit if/else producing target_pc
+/// when the cmp holds, fallthrough_pc otherwise. (Earlier attempt used wasm
+/// `select` over two i64 constants; that hung tight inner loops — kept the
+/// if/else form to rule out any runtime-side polymorphic-select issue.)
+fn branch(
+    f: &mut Function,
+    rs1: u32,
+    rs2: u32,
+    target_pc: i64,
+    fallthrough_pc: u64,
+    cmp: &Instruction,
+) {
+    load_reg(f, rs1);
+    load_reg(f, rs2);
+    f.instruction(cmp);
+    f.instruction(&Instruction::If(BlockType::Result(ValType::I64)));
+    f.instruction(&Instruction::I64Const(target_pc));
+    f.instruction(&Instruction::Else);
+    f.instruction(&Instruction::I64Const(fallthrough_pc as i64));
+    f.instruction(&Instruction::End);
 }
 
 fn load_reg(f: &mut Function, rs_off: u32) {

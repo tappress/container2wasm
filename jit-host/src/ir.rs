@@ -51,6 +51,16 @@ pub enum OpKind {
     Sllw = 27,
     Srlw = 28,
     Sraw = 29,
+    // Terminators (Batch 3). Always the last op in a block; leave next_pc on
+    // the wasm stack as the function result.
+    Jal = 30,   // rd_off, imm = target_pc (absolute)
+    Jalr = 31,  // rd_off, rs1_off, imm = signed 12-bit displacement
+    Beq = 32,   // rs1_off, rs2_off, imm = target_pc
+    Bne = 33,
+    Blt = 34,
+    Bge = 35,
+    Bltu = 36,
+    Bgeu = 37,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -84,6 +94,34 @@ pub enum Op {
     Sllw { rd: u32, rs1: u32, rs2: u32 },
     Srlw { rd: u32, rs1: u32, rs2: u32 },
     Sraw { rd: u32, rs1: u32, rs2: u32 },
+    // Terminators. end_pc (passed to build_block) serves as both link_pc
+    // (JAL/JALR) and fallthrough_pc (Bxx) — they're always pc_term + 4.
+    Jal { rd: u32, target_pc: i64 },
+    Jalr { rd: u32, rs1: u32, imm: i64 },
+    Beq { rs1: u32, rs2: u32, target_pc: i64 },
+    Bne { rs1: u32, rs2: u32, target_pc: i64 },
+    Blt { rs1: u32, rs2: u32, target_pc: i64 },
+    Bge { rs1: u32, rs2: u32, target_pc: i64 },
+    Bltu { rs1: u32, rs2: u32, target_pc: i64 },
+    Bgeu { rs1: u32, rs2: u32, target_pc: i64 },
+}
+
+impl Op {
+    /// Terminators emit their own next_pc onto the wasm stack; build_block
+    /// must NOT append a trailing static end_pc constant.
+    pub fn is_terminator(&self) -> bool {
+        matches!(
+            self,
+            Op::Jal { .. }
+                | Op::Jalr { .. }
+                | Op::Beq { .. }
+                | Op::Bne { .. }
+                | Op::Blt { .. }
+                | Op::Bge { .. }
+                | Op::Bltu { .. }
+                | Op::Bgeu { .. }
+        )
+    }
 }
 
 pub const TUPLE_SIZE: usize = 16;
@@ -129,6 +167,14 @@ pub fn parse_ir(bytes: &[u8]) -> Vec<Op> {
             x if x == OpKind::Sllw as u8 => Op::Sllw { rd, rs1, rs2 },
             x if x == OpKind::Srlw as u8 => Op::Srlw { rd, rs1, rs2 },
             x if x == OpKind::Sraw as u8 => Op::Sraw { rd, rs1, rs2 },
+            x if x == OpKind::Jal as u8 => Op::Jal { rd, target_pc: imm },
+            x if x == OpKind::Jalr as u8 => Op::Jalr { rd, rs1, imm },
+            x if x == OpKind::Beq as u8 => Op::Beq { rs1, rs2, target_pc: imm },
+            x if x == OpKind::Bne as u8 => Op::Bne { rs1, rs2, target_pc: imm },
+            x if x == OpKind::Blt as u8 => Op::Blt { rs1, rs2, target_pc: imm },
+            x if x == OpKind::Bge as u8 => Op::Bge { rs1, rs2, target_pc: imm },
+            x if x == OpKind::Bltu as u8 => Op::Bltu { rs1, rs2, target_pc: imm },
+            x if x == OpKind::Bgeu as u8 => Op::Bgeu { rs1, rs2, target_pc: imm },
             other => panic!("unknown IR op_kind {}", other),
         };
         ops.push(op);

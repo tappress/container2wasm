@@ -14,10 +14,8 @@
 //!   - jit.mark_uncompilable — sentinel for "this PC has no eligible block"
 //!                              so the C scanner doesn't keep re-trying
 
-mod codegen;
-mod ir;
-
-use std::collections::HashMap;
+use jit_host::codegen;
+use std::collections::{HashMap, VecDeque};
 use wasmtime::*;
 use wasmtime_wasi::WasiCtxBuilder;
 use wasmtime_wasi::p1::WasiP1Ctx;
@@ -27,13 +25,31 @@ struct HostState {
     /// Compiled-block table keyed by guest PC. `Some(Some(_))` = compiled,
     /// `Some(None)` = "uncompilable" sentinel (don't retry).
     blocks: HashMap<u64, Option<TypedFunc<i32, i64>>>,
+    /// Content-addressed cache: (end_pc, ir_bytes) -> compiled func. Survives
+    /// flushes — a flush only drops pc->block mappings; re-registration after
+    /// a rescan re-links from here without recompiling or re-instantiating.
+    /// Staleness-immune by construction: the scanner always reads current
+    /// guest bytes, so changed code produces a different key. Also keeps the
+    /// store's instance count bounded by unique block content (wasmtime caps
+    /// instances per store at ~10k).
+    module_cache: HashMap<(u64, Vec<u8>), TypedFunc<i32, i64>>,
     /// Cached handle to the guest module's exported linear memory.
     guest_memory: Option<Memory>,
+    /// Raises wasmtime's default 10k-instances-per-store cap — every unique
+    /// compiled block is an instance, and V8's self-modifying code mints new
+    /// unique content continuously, so Node workloads blow past 10k.
+    limits: StoreLimits,
     n_register_ok: u64,
     n_register_fail: u64,
+    n_cache_hit: u64,
     n_dispatch_hit: u64,
     n_dispatch_miss: u64,
+    /// Mapping-change flushes received, indexed by kind (satp/sfence/fence.i).
+    n_flush: [u64; 3],
     compile_nanos: u64,
+    /// Ring buffer of recent (pc_in, pc_out) dispatch pairs. Empty unless
+    /// JIT_TRACE_DISPATCH was set. See dispatch_indirect import below.
+    dispatch_trace: VecDeque<(u64, u64)>,
 }
 
 fn main() -> Result<()> {
@@ -45,7 +61,30 @@ fn main() -> Result<()> {
     let wasm_path = &args[1];
     let guest_args = &args[2..];
 
-    let engine = Engine::default();
+    // JIT_TIMEOUT_SECS=N triggers wasmtime epoch interruption after N seconds —
+    // turns a hang into a clean trap so dump_stats (and the dispatch trace) get
+    // to run before we exit. Off by default.
+    let timeout_secs: u64 = std::env::var("JIT_TIMEOUT_SECS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0);
+    let mut config = Config::new();
+    if timeout_secs > 0 {
+        config.epoch_interruption(true);
+    }
+    let engine = Engine::new(&config)?;
+    if timeout_secs > 0 {
+        let engine_clone = engine.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_secs(timeout_secs));
+            // Several increments — store.set_epoch_deadline(1) below means even
+            // one is enough, but multiple guarantees the trap fires at the
+            // next backedge regardless of where we are.
+            for _ in 0..8 {
+                engine_clone.increment_epoch();
+            }
+        });
+    }
 
     // Pre-flight: build, compile, instantiate, and invoke a trivial dynamic
     // wasm module to verify the wasm-encoder -> wasmtime pipeline before we
@@ -54,6 +93,11 @@ fn main() -> Result<()> {
         let bytes = codegen::build_preflight();
         let m = Module::from_binary(&engine, &bytes)?;
         let mut probe_store: Store<()> = Store::new(&engine, ());
+        if timeout_secs > 0 {
+            // epoch_interruption is on engine-wide; without an explicit
+            // deadline here the probe would trap on the timer's first bump.
+            probe_store.set_epoch_deadline(u64::MAX);
+        }
         let inst = Instance::new(&mut probe_store, &m, &[])?;
         let f = inst.get_typed_func::<i32, i64>(&mut probe_store, "block")?;
         let r = f.call(&mut probe_store, 0)?;
@@ -82,20 +126,39 @@ fn main() -> Result<()> {
         "dispatch_noop",
         |_pc: i64, _state_ptr: i32| -> i64 { 0 },
     )?;
+    // JIT_TRACE_DISPATCH=N: log the LAST N (pc_in, pc_out) dispatch pairs to
+    // stderr at exit. Stored in a ring buffer to avoid unbounded growth or
+    // tearing apart hot loops with per-call I/O. N=0 disables.
+    let trace_capacity: usize = std::env::var("JIT_TRACE_DISPATCH")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0);
     linker.func_wrap(
         "jit",
         "dispatch_indirect",
-        |mut caller: Caller<'_, HostState>, pc: i64, state_ptr: i32| -> i64 {
+        move |mut caller: Caller<'_, HostState>, pc: i64, state_ptr: i32| -> Result<i64> {
             let typed = match caller.data().blocks.get(&(pc as u64)) {
                 Some(Some(f)) => f.clone(),
                 _ => {
                     caller.data_mut().n_dispatch_miss += 1;
-                    return 0;
+                    return Ok(0);
                 }
             };
-            let r = typed.call(&mut caller, state_ptr).unwrap_or(0);
-            caller.data_mut().n_dispatch_hit += 1;
-            r
+            // Propagate any trap from the compiled block (incl. epoch deadline)
+            // up to the c2w wasm caller and then out of start.call. Without
+            // this, the previous `.unwrap_or(0)` swallowed traps and turned
+            // them into "fallback to interpreter", which both hid bugs and
+            // made JIT_TIMEOUT_SECS unable to escape JIT-tight loops.
+            let r = typed.call(&mut caller, state_ptr)?;
+            let st = caller.data_mut();
+            st.n_dispatch_hit += 1;
+            if trace_capacity > 0 {
+                st.dispatch_trace.push_back((pc as u64, r as u64));
+                while st.dispatch_trace.len() > trace_capacity {
+                    st.dispatch_trace.pop_front();
+                }
+            }
+            Ok(r)
         },
     )?;
     let disable_compile = std::env::var_os("JIT_DISABLE_COMPILE").is_some();
@@ -154,6 +217,34 @@ fn main() -> Result<()> {
             caller.data_mut().blocks.insert(pc as u64, None);
         },
     )?;
+    // The guest signals "VA->code mapping may have changed". kind 0 = satp
+    // write: only user-half blocks can be stale (kernel half is globally
+    // mapped), so retain those. kind 1 = sfence.vma: addr != 0 limits the
+    // drop to that page (blocks never span pages). kind 2 = fence.i: drop
+    // everything. JIT_IGNORE_FLUSH=1 turns this into a counter-only no-op so
+    // the same wasm can be A/B-run with invalidation off.
+    let ignore_flush = std::env::var_os("JIT_IGNORE_FLUSH").is_some();
+    const KERNEL_HALF_BASE: u64 = 0xffff_ffc0_0000_0000;
+    const PG_MASK: u64 = 0xfff;
+    linker.func_wrap(
+        "jit",
+        "flush_blocks",
+        move |mut caller: Caller<'_, HostState>, kind: i32, addr: i64| {
+            let st = caller.data_mut();
+            st.n_flush[(kind as usize).min(2)] += 1;
+            if ignore_flush {
+                return;
+            }
+            match kind {
+                0 => st.blocks.retain(|&pc, _| pc >= KERNEL_HALF_BASE),
+                1 if addr != 0 => {
+                    let page = (addr as u64) & !PG_MASK;
+                    st.blocks.retain(|&pc, _| pc & !PG_MASK != page);
+                }
+                _ => st.blocks.clear(),
+            }
+        },
+    )?;
 
     let mut wasi_builder = WasiCtxBuilder::new();
     wasi_builder.inherit_stdout().inherit_stderr();
@@ -173,14 +264,25 @@ fn main() -> Result<()> {
     let state = HostState {
         wasi,
         blocks: HashMap::new(),
+        module_cache: HashMap::new(),
+        limits: StoreLimitsBuilder::new()
+            .instances(1_000_000)
+            .build(),
         guest_memory: None,
         n_register_ok: 0,
         n_register_fail: 0,
+        n_cache_hit: 0,
         n_dispatch_hit: 0,
         n_dispatch_miss: 0,
+        n_flush: [0; 3],
         compile_nanos: 0,
+        dispatch_trace: VecDeque::new(),
     };
     let mut store = Store::new(&engine, state);
+    store.limiter(|s| &mut s.limits);
+    if timeout_secs > 0 {
+        store.set_epoch_deadline(1);
+    }
 
     let instance = linker.instantiate(&mut store, &module)?;
     // Cache the guest's exported memory before _start runs (register_block
@@ -205,14 +307,25 @@ fn main() -> Result<()> {
 fn dump_stats(store: &Store<HostState>) {
     let st = store.data();
     eprintln!(
-        "[jit-host] stats: blocks={} reg_ok={} reg_fail={} dispatch_hit={} dispatch_miss={} compile_ms={:.1}",
+        "[jit-host] stats: blocks={} cache={} reg_ok={} cache_hit={} reg_fail={} dispatch_hit={} dispatch_miss={} flush_satp={} flush_sfence={} flush_fencei={} compile_ms={:.1}",
         st.blocks.len(),
+        st.module_cache.len(),
         st.n_register_ok,
+        st.n_cache_hit,
         st.n_register_fail,
         st.n_dispatch_hit,
         st.n_dispatch_miss,
+        st.n_flush[0],
+        st.n_flush[1],
+        st.n_flush[2],
         st.compile_nanos as f64 / 1e6,
     );
+    if !st.dispatch_trace.is_empty() {
+        eprintln!("[jit-host] last {} dispatches (pc_in -> pc_out):", st.dispatch_trace.len());
+        for (pc_in, pc_out) in st.dispatch_trace.iter() {
+            eprintln!("  0x{pc_in:x} -> 0x{pc_out:x}");
+        }
+    }
 }
 
 fn register_block_inner(
@@ -236,6 +349,19 @@ fn register_block_inner(
     }
     let ir_bytes = data[start..end].to_vec();
 
+    // Debugging: env-var filters to reject specific terminator classes.
+    // JIT_NO_BRANCH=1   skips blocks whose last op is a conditional branch.
+    // JIT_NO_JUMP=1     skips blocks whose last op is JAL/JALR.
+    if !ir_bytes.is_empty() {
+        let last_kind = ir_bytes[ir_bytes.len() - 16];
+        if std::env::var_os("JIT_NO_BRANCH").is_some() && (32..=37).contains(&last_kind) {
+            return Err(Error::msg("JIT_NO_BRANCH: skipping branch terminator"));
+        }
+        if std::env::var_os("JIT_NO_JUMP").is_some() && (last_kind == 30 || last_kind == 31) {
+            return Err(Error::msg("JIT_NO_JUMP: skipping jump terminator"));
+        }
+    }
+
     // Debugging: optionally truncate IR to first N ops to bisect bad blocks.
     let ir_bytes = if let Ok(n) = std::env::var("JIT_TRUNCATE_OPS_AT_PC") {
         let parts: Vec<&str> = n.split('@').collect();
@@ -255,7 +381,35 @@ fn register_block_inner(
     } else {
         ir_bytes
     };
+    // Content-cache hit: same IR bytes + same end_pc produce byte-identical
+    // wasm, so reuse the existing instance instead of recompiling.
+    let cache_key = (end_pc, ir_bytes.clone());
+    if let Some(f) = caller.data().module_cache.get(&cache_key) {
+        let f = f.clone();
+        let st = caller.data_mut();
+        st.n_cache_hit += 1;
+        st.blocks.insert(pc, Some(f));
+        return Ok(());
+    }
     let bytes = codegen::build_block(&ir_bytes, end_pc);
+    // JIT_DUMP_PCS=11eb0,ffffffff8002561a,... — dump IR+wasm for specific PCs
+    // (hex, no 0x prefix needed) at registration time.
+    if let Ok(pcs_str) = std::env::var("JIT_DUMP_PCS") {
+        let wanted = pcs_str
+            .split(',')
+            .filter_map(|t| u64::from_str_radix(t.trim().trim_start_matches("0x"), 16).ok())
+            .any(|p| p == pc);
+        if wanted {
+            let path = format!("/tmp/jit_block_pc{pc:x}.wasm");
+            let ir_path = format!("/tmp/jit_block_pc{pc:x}.ir.bin");
+            let _ = std::fs::write(&path, &bytes);
+            let _ = std::fs::write(&ir_path, &ir_bytes);
+            eprintln!(
+                "[jit-host] dumped block pc=0x{pc:x} end_pc=0x{end_pc:x} ir_len={} -> {path}",
+                ir_bytes.len()
+            );
+        }
+    }
     if let Ok(idx_str) = std::env::var("JIT_DUMP_NTH") {
         if let Ok(idx) = idx_str.parse::<u64>() {
             let cur = caller.data().n_register_ok;
@@ -277,6 +431,8 @@ fn register_block_inner(
     let typed = inst
         .get_typed_func::<i32, i64>(&mut *caller, "block")
         .map_err(|e| Error::msg(format!("compiled module typed-func error: {e}")))?;
-    caller.data_mut().blocks.insert(pc, Some(typed));
+    let st = caller.data_mut();
+    st.module_cache.insert(cache_key, typed.clone());
+    st.blocks.insert(pc, Some(typed));
     Ok(())
 }

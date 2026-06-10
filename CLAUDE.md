@@ -382,3 +382,23 @@ Coverage ceiling for ALU-only is small: only ~8% of executed insns end up inside
 1. Push to Batch 3 (branches+jumps). Likely takes us well past 2× because branch-bound BBs become single compiled blocks instead of 5-10 dispatch-miss interpreter trips.
 2. Implement Q3 invalidation first, re-enable AUIPC. Smaller incremental win (probably to ~1.4-1.5×) and lays the foundation for Batch 4 (loads/stores) where invalidation hygiene matters more.
 Default plan: do (1) next, fold (2) in before Batch 4.
+
+#### Batch 3 result (2026-06-10): correctness landed (incl. Q3 invalidation + AUIPC back on); perf regressed — dispatch architecture is now the bottleneck
+
+**The hang and its root cause.** With branch codegen enabled, Node hello hung deterministically after ~556 branch blocks compiled — guest spinning ~23M block-entries/sec in a fixed 6-PC kernel wait loop (trace: `JIT_TRACE_DISPATCH=N` env, dispatch ring buffer dumped at exit; epoch-based `JIT_TIMEOUT_SECS=N` turns hangs into clean traps). Per-block codegen was verified correct three ways: standalone semantic test of the bisected block ([jit-host/tests/block_n555.rs](jit-host/tests/block_n555.rs)), bit-level desk-check of the scanner's B/J-type immediate decode, and desk-check of all six branch condition mappings. The actual bug: **blocks are keyed by virtual PC with no invalidation**, so compiled blocks survived address-space switches (satp writes), PTE updates (sfence.vma), and V8's self-modifying code (fence.i) — stale code ran at reused VAs and corrupted a userspace process; the kernel loop was just the downstream wait-for-event symptom. The Batch 2 "AUIPC corruption" was this same class (a baked PC-relative constant is no more exposed than a baked branch target); AUIPC is re-enabled and Node hello passes.
+
+**Fix shape (committed)**: TinyEMU calls a new `jit.flush_blocks(kind, addr)` import from the three mapping-change points — satp write (kind 0), sfence.vma (kind 1, addr-targeted when rs1!=0), fence.i (kind 2) — and clears its scan tried-cache. Host policy: satp drops only user-half blocks (kernel half is globally mapped), targeted sfence drops one page (blocks never span pages), fence.i drops all. Naive drop-and-recompile starved the run (wasmtime's default 10k-instances-per-Store cap + 107s of cranelift churn), so the host keeps a **content-addressed cache** keyed by (end_pc, IR bytes): a flush only drops pc→block mappings; re-registration after rescan re-links the existing instance. Staleness-immune by construction (scanner reads current bytes → changed code = different key) and absorbs 95%+ of re-registrations. Store limit raised to 1M instances via StoreLimits (`cache=10-12k` unique blocks on Node hello — V8 SMC mints new content continuously). `JIT_IGNORE_FLUSH=1` A/Bs invalidation off on the same wasm.
+
+**Numbers (Ryzen 9 7000, 3-run medians where noted)**:
+| Workload | Interp baseline | Batch 2 (ALU) | Batch 3 (br+jmp+AUIPC+invalidation) |
+|---|---|---|---|
+| node hello | 12.5s | ~13s | 17.6s (no AUIPC) / 21.7s (AUIPC) |
+| 1e8 arith loop | 114s (jit2) | 91s (1.25×) | **161s — regression** |
+
+Output correct in all runs; `reg_fail=0`; hello compiles ~10k unique blocks (~8.5s cranelift at ~0.85ms/module — the "batch many BBs per module" item is now real).
+
+**Why perf regressed — the load-bearing finding**: every block entry crosses wasm→host (`dispatch_indirect` closure: HashMap lookup ~35ns), and hits pay host→wasm re-entry (~150ns) on top. A 3-4-insn block interprets in ~40ns, so under host-side dispatch **small blocks are net-negative** — the 1e8 run made 1.86B entries (474M hits) and the boundary costs swamp the codegen wins. Batch 1 measured 1.4ns/entry precisely because dispatch then lived inside wasm (static preloaded table + `call_indirect`); Batch 2 moved dispatch into a host closure to get dynamic registration, and that expediency is now the dominant cost.
+
+**Next step (before Batch 4)**: move dispatch back into wasm — funcref `Table` + a wasm-side PC→table-index map (hash or direct-mapped, in linear memory), `call_indirect` from the interpreter hook, host touched only at registration/flush. Target: restore ~ns-scale dispatch so Batch 3's coverage translates into wallclock wins; re-measure 1e8 (expect well under 91s) and busybox echo hi (the formal ≥1.5× gate) before starting loads/stores.
+
+**What committed where**: tinyemu-c2w `bafb2e4` (invalidation hooks, tried-cache global, AUIPC re-enable, n_cycles charge per compiled block), container2wasm — jit-host flush_blocks + content cache + StoreLimits + diagnostics (`JIT_TIMEOUT_SECS`, `JIT_TRACE_DISPATCH`, `JIT_DUMP_PCS`, `JIT_NO_BRANCH`/`JIT_NO_JUMP`, bisect-bad-block.py), lib.rs split + tests/.
