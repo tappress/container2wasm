@@ -514,3 +514,27 @@ The A/B pins it: same artifact, the probe codegen alone costs +2.0s execution +0
 2. **Block chaining / longer regions** (Q2) — direct attack on (b).
 3. **Async/background compile** — takes (a) off the guest's critical path; echo's lever.
 4. Register lifting (Batch 6) stays parked until blocks are longer; inline TLB re-evaluated at browser-port time.
+
+#### Batch 4.5 result (2026-06-11): RV64M + RV64A coverage lands — strictly dominates Batch 5 (hello −10%, echo −15%, loop tie); coverage's wallclock ceiling now measured
+
+**What was built** (tinyemu-c2w `3e06378`, container2wasm this commit):
+- **RV64M inline**: MUL/MULH/MULHSU/MULHU/DIV/DIVU/REM/REMU + W-forms (IR kinds 49-61) compile to wasm arithmetic. Wasm div/rem trap where RISC-V defines results, so codegen guards them (div/0 = −1, rem/0 = dividend, INT_MIN/−1 = INT_MIN with rem 0 — wasm's `rem_s` already yields 0 there without trapping; W-forms pre-narrow operands so the 64-bit wasm ops are exact 32-bit arithmetic). The mulh family synthesizes the true 128-bit high word from four 32×32 partial products plus sign-correction identities (mulh = mulhu(a,b) − ((a≫63)&b) − ((b≫63)&a)). **Trap discovered en route**: TinyEMU's non-int128 `mulh`/`mulhsu` fallback in riscv_cpu_template.h subtracts the *wrong operand* (`r1 -= a` under `a < 0`; correct is `b`) — but it's dead code: the wasm build defines `HAVE_INT128` (`__SIZEOF_INT128__`; confirmed via `__multi3` in the artifact), so the interpreter computes the true high word and codegen matches that. If anyone ever builds without int128, that fallback is an upstream bug to fix, not to replicate.
+- **RV64A via helpers**: LR/SC/AMO .w/.d (IR kinds 62-63, imm packs funct5 | pc_off≪8) call two new guest exports `c2w_jit_amo_w/d` mirroring the interpreter's OP_A macro case-for-case (LR sets load_res, SC compares-without-clearing, AMOs RMW with rd = sign-extended old value; aq/rl ignored like `insn >> 27`). Same wasm→wasm import wiring and fault convention as Batch 4 loads/stores; the atomics pair is optional at helper-resolution time so pre-4.5 artifacts still run under the new jit-host. Scanner rejects LR with rs2≠0 and reserved funct5 (interpreter raises illegal); the rd==x0 short-circuit now excludes 0x2f (an AMO performs its RMW regardless of rd).
+- Debug knobs `JIT_NO_MULDIV=1` / `JIT_NO_AMO=1`; 5 new semantic tests ([jit-host/tests/muldiv_amo.rs](jit-host/tests/muldiv_amo.rs)) — the full MulDiv kind matrix vs an i128 Rust reference over 14 edge-case operand pairs, AMO args/wiring/funct5/x0-sentinel, fault tag + skip-rest, mid-block scratch-local threading.
+
+**Numbers (3-run interleaved medians, same session; jit6 = this batch)**:
+
+| Workload | jit0 (true interp) | jit5 (Batch 5 default) | **jit6 (M+A)** |
+|---|---|---|---|
+| busybox echo hi | 2.01s | 3.38s | **2.88s** |
+| node hello | 10.34s | 14.27s | **12.87s** (beats jit5 in all 3 rounds) |
+| 1e8 arith loop | 70.07s | 69.96s | **70.40s** (tie) |
+
+All outputs correct, reg_fail=0. Block-entry hit rate on hello 64.9% → 67.2%; unique blocks drop (687 → 625) while entries hold — blocks got longer, as intended.
+
+**The load-bearing finding — coverage's wallclock ceiling**: loop insn coverage rose 48.3% → 54.7% (interpreted insns 2.36B → 2.07B of jit0's 4.56B total) with **zero wallclock change**. With compiled code at per-insn parity with the interpreter (Batch 5's correction), moving insns from interpreted to compiled is wallclock-neutral; the hello/echo wins came from longer blocks ⇒ fewer dispatch misses and shorter scan/compile tails, not from faster execution of the covered insns. Adding further coverage terminators (FP, CSR) without first attacking per-entry overhead or compile cost would mostly re-prove this. On hello, coverage barely moved at all (59.8% → 60.7%) — M/A insns there were sprinkled through already-compiled regions, not block-killers.
+
+**Verdict**: keep (strictly ≥ Batch 5 on every workload; vs jit0: hello 0.80×, echo 0.70×, loop parity). Next levers unchanged and now sharper:
+1. **Block chaining / longer regions** — at ~4-6 insns/block and ~2B entries per loop run, entry overhead is the loop's whole remaining story.
+2. **Async/background compile** — echo's gap to jit0 is still mostly cranelift-on-critical-path (~2.2-2.4s compile_ms on hello-class boots).
+3. **Browser-worker port checkpoint** (overdue since Batch 3) before more wasmtime-specific tuning — both remaining levers shape differently there (JS host boundary, Liftoff tiering).

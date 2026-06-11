@@ -76,6 +76,27 @@ pub enum OpKind {
     Sh = 46,
     Sw = 47,
     Sd = 48,
+    // RV64M (Batch 4.5). Pure register ops, inlined. The guest build defines
+    // HAVE_INT128, so mulh/mulhsu/mulhu must match the interpreter's true
+    // 128-bit high word.
+    Mul = 49,
+    Mulh = 50,
+    Mulhsu = 51,
+    Mulhu = 52,
+    Div = 53,
+    Divu = 54,
+    Rem = 55,
+    Remu = 56,
+    Mulw = 57,
+    Divw = 58,
+    Divuw = 59,
+    Remw = 60,
+    Remuw = 61,
+    // RV64A (Batch 4.5). Helper-call ops like loads/stores: rd_off (0 = x0,
+    // helper skips writeback), rs1_off = address reg, rs2_off = value reg,
+    // imm = funct5 | (pc_off << 8).
+    AmoW = 62,
+    AmoD = 63,
 }
 
 /// Load width + extension; doubles as the helper-import identity.
@@ -97,6 +118,24 @@ pub enum StoreW {
     H,
     W,
     D,
+}
+
+/// RV64M op selector (all inlined by codegen).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MdOp {
+    Mul,
+    Mulh,
+    Mulhsu,
+    Mulhu,
+    Div,
+    Divu,
+    Rem,
+    Remu,
+    Mulw,
+    Divw,
+    Divuw,
+    Remw,
+    Remuw,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -146,6 +185,10 @@ pub enum Op {
     // codegen bakes start_pc + pc_off as the tagged fault-return pc.
     Load { w: LoadW, rd: u32, rs1: u32, imm: i64, pc_off: u32 },
     Store { w: StoreW, rs1: u32, rs2: u32, imm: i64, pc_off: u32 },
+    // RV64M. rd is never 0 (the scanner's x0 short-circuit skips pure ops).
+    MulDiv { op: MdOp, rd: u32, rs1: u32, rs2: u32 },
+    // RV64A. Helper performs the full RMW (or LR/SC) and the rd writeback.
+    Amo { d: bool, rd: u32, rs1: u32, rs2: u32, funct5: u32, pc_off: u32 },
 }
 
 impl Op {
@@ -228,6 +271,27 @@ pub fn parse_ir(bytes: &[u8]) -> Vec<Op> {
             x if x == OpKind::Sh as u8 => Op::Store { w: StoreW::H, rs1, rs2, imm, pc_off: rd },
             x if x == OpKind::Sw as u8 => Op::Store { w: StoreW::W, rs1, rs2, imm, pc_off: rd },
             x if x == OpKind::Sd as u8 => Op::Store { w: StoreW::D, rs1, rs2, imm, pc_off: rd },
+            x if x == OpKind::Mul as u8 => Op::MulDiv { op: MdOp::Mul, rd, rs1, rs2 },
+            x if x == OpKind::Mulh as u8 => Op::MulDiv { op: MdOp::Mulh, rd, rs1, rs2 },
+            x if x == OpKind::Mulhsu as u8 => Op::MulDiv { op: MdOp::Mulhsu, rd, rs1, rs2 },
+            x if x == OpKind::Mulhu as u8 => Op::MulDiv { op: MdOp::Mulhu, rd, rs1, rs2 },
+            x if x == OpKind::Div as u8 => Op::MulDiv { op: MdOp::Div, rd, rs1, rs2 },
+            x if x == OpKind::Divu as u8 => Op::MulDiv { op: MdOp::Divu, rd, rs1, rs2 },
+            x if x == OpKind::Rem as u8 => Op::MulDiv { op: MdOp::Rem, rd, rs1, rs2 },
+            x if x == OpKind::Remu as u8 => Op::MulDiv { op: MdOp::Remu, rd, rs1, rs2 },
+            x if x == OpKind::Mulw as u8 => Op::MulDiv { op: MdOp::Mulw, rd, rs1, rs2 },
+            x if x == OpKind::Divw as u8 => Op::MulDiv { op: MdOp::Divw, rd, rs1, rs2 },
+            x if x == OpKind::Divuw as u8 => Op::MulDiv { op: MdOp::Divuw, rd, rs1, rs2 },
+            x if x == OpKind::Remw as u8 => Op::MulDiv { op: MdOp::Remw, rd, rs1, rs2 },
+            x if x == OpKind::Remuw as u8 => Op::MulDiv { op: MdOp::Remuw, rd, rs1, rs2 },
+            x if x == OpKind::AmoW as u8 || x == OpKind::AmoD as u8 => Op::Amo {
+                d: x == OpKind::AmoD as u8,
+                rd,
+                rs1,
+                rs2,
+                funct5: (imm & 0xff) as u32,
+                pc_off: (imm >> 8) as u32,
+            },
             other => panic!("unknown IR op_kind {}", other),
         };
         ops.push(op);

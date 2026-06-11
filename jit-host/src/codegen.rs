@@ -11,14 +11,16 @@
 //!
 //! IR is a flat byte stream from the C scanner. See [crate::ir].
 
-use crate::ir::{LoadW, Op, StoreW, parse_ir};
+use crate::ir::{LoadW, MdOp, Op, StoreW, parse_ir};
 use wasm_encoder::*;
 
 /// Guest export names of the memory helpers, indexed by helper id (loads
-/// 0-6 = lb/lh/lw/ld/lbu/lhu/lwu, stores 7-10 = sb/sh/sw/sd). main.rs
-/// resolves these from the c2w instance and passes them as block imports
-/// positionally, so the order here is load-bearing.
-pub const MEM_HELPER_EXPORTS: [&str; 11] = [
+/// 0-6 = lb/lh/lw/ld/lbu/lhu/lwu, stores 7-10 = sb/sh/sw/sd, atomics
+/// 11-12 = amo_w/amo_d). main.rs resolves these from the c2w instance and
+/// passes them as block imports positionally, so the order here is
+/// load-bearing. The atomics pair is optional (absent on pre-Batch-4.5
+/// guests); blocks using them then fail registration and stay interpreted.
+pub const MEM_HELPER_EXPORTS: [&str; 13] = [
     "c2w_jit_lb",
     "c2w_jit_lh",
     "c2w_jit_lw",
@@ -30,7 +32,13 @@ pub const MEM_HELPER_EXPORTS: [&str; 11] = [
     "c2w_jit_sh",
     "c2w_jit_sw",
     "c2w_jit_sd",
+    "c2w_jit_amo_w",
+    "c2w_jit_amo_d",
 ];
+
+/// Helper ids 0..BASE_HELPERS-1 must all be present for any mem codegen;
+/// ids from BASE_HELPERS up are optional extensions.
+pub const BASE_HELPERS: usize = 11;
 
 /// TLB layout constants read once from the guest's `c2w_jit_tlb_layout`
 /// export (Batch 5). All offsets are byte offsets in the guest's linear
@@ -87,6 +95,7 @@ fn helper_id(op: &Op) -> Option<usize> {
             StoreW::W => 9,
             StoreW::D => 10,
         }),
+        Op::Amo { d, .. } => Some(if d { 12 } else { 11 }),
         _ => None,
     }
 }
@@ -96,7 +105,7 @@ fn helper_id(op: &Op) -> Option<usize> {
 struct Ctx {
     start_pc: u64,
     block_end_pc: u64,
-    helper_import_idx: [Option<u32>; 11],
+    helper_import_idx: [Option<u32>; 13],
     tlb: Option<TlbLayout>,
 }
 
@@ -126,7 +135,7 @@ pub fn build_block(
     let mut used: Vec<usize> = ops.iter().filter_map(helper_id).collect();
     used.sort_unstable();
     used.dedup();
-    let mut helper_import_idx = [None; 11];
+    let mut helper_import_idx = [None; 13];
     for (i, &h) in used.iter().enumerate() {
         helper_import_idx[h] = Some(i as u32);
     }
@@ -134,8 +143,9 @@ pub fn build_block(
     let mut module = Module::new();
 
     // Types: 0 = block (i32)->(i64), 1 = load helper (state, addr, rd_off)
-    // -> fault, 2 = store helper (state, addr, val) -> fault. 1 and 2 are
-    // emitted unconditionally so indices stay fixed.
+    // -> fault, 2 = store helper (state, addr, val) -> fault, 3 = amo helper
+    // (state, addr, val2, funct5, rd_off) -> fault. All emitted
+    // unconditionally so indices stay fixed.
     let mut types = TypeSection::new();
     types.ty().function(vec![ValType::I32], vec![ValType::I64]);
     types
@@ -144,6 +154,10 @@ pub fn build_block(
     types
         .ty()
         .function(vec![ValType::I32, ValType::I64, ValType::I64], vec![ValType::I32]);
+    types.ty().function(
+        vec![ValType::I32, ValType::I64, ValType::I64, ValType::I32, ValType::I32],
+        vec![ValType::I32],
+    );
     module.section(&types);
 
     // Imports: guest.mem (we don't actually need any min pages; the host
@@ -162,7 +176,13 @@ pub fn build_block(
         }),
     );
     for &h in &used {
-        let ty = if h < 7 { 1 } else { 2 };
+        let ty = if h < 7 {
+            1
+        } else if h < BASE_HELPERS {
+            2
+        } else {
+            3
+        };
         imports.import("guest", MEM_HELPER_EXPORTS[h], EntityType::Function(ty));
     }
     module.section(&imports);
@@ -187,9 +207,11 @@ pub fn build_block(
     };
 
     // Code. Locals: 1 (i64) = JALR new_pc stash (avoids rs1 == rd hazard),
-    // 2 (i64) = mem-op effective address, 3 (i32) = TLB entry pointer.
+    // 2 (i64) = mem-op effective address, 3 (i32) = TLB entry pointer,
+    // 4-6 (i64) = MUL/DIV scratch (a, b, mulh sign-correction). 1 and 2
+    // double as mulhu partial-product scratch — they're free between ops.
     let mut codes = CodeSection::new();
-    let mut f = Function::new(vec![(2, ValType::I64), (1, ValType::I32)]);
+    let mut f = Function::new(vec![(2, ValType::I64), (1, ValType::I32), (3, ValType::I64)]);
     let ends_with_terminator = ops.last().map(Op::is_terminator).unwrap_or(false);
     emit_ops(&mut f, &ops, &ctx);
     // Non-terminator block: fall through to the static end-PC constant.
@@ -538,7 +560,251 @@ fn emit_one(f: &mut Function, op: &Op, ctx: &Ctx) {
                 fault_check(f, fault_pc);
             }
         }
+
+        // RV64M (Batch 4.5): inlined, see muldiv().
+        MulDiv { op: md, rd, rs1, rs2 } => muldiv(f, md, rd, rs1, rs2),
+
+        // RV64A (Batch 4.5): helper call, same shape as loads/stores. The
+        // helper performs the full LR/SC/AMO semantics (load_res handling,
+        // read-modify-write, rd writeback) and returns nonzero on MMU fault.
+        // No displacement: the address is reg[rs1] directly.
+        Amo { d: _, rd, rs1, rs2, funct5, pc_off } => {
+            let fault_pc = ctx.start_pc + pc_off as u64;
+            let helper = ctx.helper_import_idx[helper_id(op).unwrap()].unwrap();
+            f.instruction(&Instruction::LocalGet(0)); // state
+            load_reg(f, rs1); // addr
+            load_reg(f, rs2); // val2
+            f.instruction(&Instruction::I32Const(funct5 as i32));
+            f.instruction(&Instruction::I32Const(rd as i32)); // rd_off, 0 = x0
+            f.instruction(&Instruction::Call(helper));
+            fault_check(f, fault_pc);
+        }
     }
+}
+
+/// RV64M codegen. Wasm's div/rem trap where RISC-V defines results (zero
+/// divisor for all four; INT_MIN/-1 additionally for div_s), so those get
+/// explicit guards reproducing the RISC-V values: div/0 = -1, rem/0 =
+/// dividend, INT_MIN div -1 = INT_MIN (rem = 0 — which wasm's rem_s already
+/// yields without trapping). mulh/mulhsu/mulhu synthesize the true 128-bit
+/// high word — matching the interpreter, whose build defines HAVE_INT128 —
+/// from mulhu partial products plus the sign-correction identities
+/// mulh = mulhu(a,b) - ((a>>63)&b) - ((b>>63)&a), mulhsu = mulhu - ((a>>63)&b).
+///
+/// Locals 4/5 hold the operands (W-forms pre-narrowed so the 64-bit wasm op
+/// gives the 32-bit result exactly); local 6 the mulh correction; mulhu_core
+/// additionally clobbers 1/2 (free between ops).
+fn muldiv(f: &mut Function, op: MdOp, rd: u32, rs1: u32, rs2: u32) {
+    use Instruction::*;
+    match op {
+        MdOp::Mul => return bin_reg(f, rd, rs1, rs2, &I64Mul),
+        MdOp::Mulw => return bin32(f, rd, rs1, rs2, &I32Mul),
+        _ => {}
+    }
+    f.instruction(&LocalGet(0)); // store_reg address for the result
+    // Load operands into locals 4 (a) and 5 (b). W-forms narrow here: signed
+    // ops sign-extend the low 32 bits, unsigned ops zero-extend, so the
+    // 64-bit compare/divide below is exact 32-bit arithmetic.
+    let narrow = match op {
+        MdOp::Divw | MdOp::Remw => Some(true),
+        MdOp::Divuw | MdOp::Remuw => Some(false),
+        _ => None,
+    };
+    for (reg, local) in [(rs1, 4), (rs2, 5)] {
+        load_reg(f, reg);
+        if let Some(signed) = narrow {
+            f.instruction(&I32WrapI64);
+            f.instruction(if signed { &I64ExtendI32S } else { &I64ExtendI32U });
+        }
+        f.instruction(&LocalSet(local));
+    }
+    match op {
+        MdOp::Mulhu => mulhu_core(f),
+        MdOp::Mulh | MdOp::Mulhsu => {
+            // l6 = ((a >> 63) & b) [+ ((b >> 63) & a) for mulh], computed
+            // before mulhu_core clobbers the operands.
+            f.instruction(&LocalGet(4));
+            f.instruction(&I64Const(63));
+            f.instruction(&I64ShrS);
+            f.instruction(&LocalGet(5));
+            f.instruction(&I64And);
+            if op == MdOp::Mulh {
+                f.instruction(&LocalGet(5));
+                f.instruction(&I64Const(63));
+                f.instruction(&I64ShrS);
+                f.instruction(&LocalGet(4));
+                f.instruction(&I64And);
+                f.instruction(&I64Add);
+            }
+            f.instruction(&LocalSet(6));
+            mulhu_core(f);
+            f.instruction(&LocalGet(6));
+            f.instruction(&I64Sub);
+        }
+        MdOp::Div | MdOp::Divw => {
+            let min = if op == MdOp::Div { i64::MIN } else { i32::MIN as i64 };
+            f.instruction(&LocalGet(5));
+            f.instruction(&I64Eqz);
+            f.instruction(&If(BlockType::Result(ValType::I64)));
+            f.instruction(&I64Const(-1));
+            f.instruction(&Else);
+            f.instruction(&LocalGet(4));
+            f.instruction(&I64Const(min));
+            f.instruction(&I64Eq);
+            f.instruction(&LocalGet(5));
+            f.instruction(&I64Const(-1));
+            f.instruction(&I64Eq);
+            f.instruction(&I32And);
+            f.instruction(&If(BlockType::Result(ValType::I64)));
+            f.instruction(&LocalGet(4));
+            f.instruction(&Else);
+            // Guards exclude both wasm trap cases; Divw quotients always
+            // fit int32 (the only overflow, MIN32/-1, took the branch above)
+            // so the i64 value already equals its 32-bit sign-extension.
+            f.instruction(&LocalGet(4));
+            f.instruction(&LocalGet(5));
+            f.instruction(&I64DivS);
+            f.instruction(&End);
+            f.instruction(&End);
+        }
+        MdOp::Divu | MdOp::Divuw => {
+            f.instruction(&LocalGet(5));
+            f.instruction(&I64Eqz);
+            f.instruction(&If(BlockType::Result(ValType::I64)));
+            f.instruction(&I64Const(-1)); // divu/0 = all ones; sext32 for W
+            f.instruction(&Else);
+            f.instruction(&LocalGet(4));
+            f.instruction(&LocalGet(5));
+            f.instruction(&I64DivU);
+            if op == MdOp::Divuw {
+                // Result is a uint32; RISC-V sign-extends it.
+                f.instruction(&I32WrapI64);
+                f.instruction(&I64ExtendI32S);
+            }
+            f.instruction(&End);
+        }
+        MdOp::Rem | MdOp::Remw => {
+            // wasm rem_s only traps on zero divisor; MIN rem -1 is defined
+            // as 0, which is exactly the RISC-V overflow value.
+            f.instruction(&LocalGet(5));
+            f.instruction(&I64Eqz);
+            f.instruction(&If(BlockType::Result(ValType::I64)));
+            f.instruction(&LocalGet(4)); // rem/0 = dividend
+            f.instruction(&Else);
+            f.instruction(&LocalGet(4));
+            f.instruction(&LocalGet(5));
+            f.instruction(&I64RemS);
+            f.instruction(&End);
+        }
+        MdOp::Remu | MdOp::Remuw => {
+            let w = op == MdOp::Remuw;
+            f.instruction(&LocalGet(5));
+            f.instruction(&I64Eqz);
+            f.instruction(&If(BlockType::Result(ValType::I64)));
+            f.instruction(&LocalGet(4)); // rem/0 = dividend (sext32 for W)
+            if w {
+                f.instruction(&I32WrapI64);
+                f.instruction(&I64ExtendI32S);
+            }
+            f.instruction(&Else);
+            f.instruction(&LocalGet(4));
+            f.instruction(&LocalGet(5));
+            f.instruction(&I64RemU);
+            if w {
+                f.instruction(&I32WrapI64);
+                f.instruction(&I64ExtendI32S);
+            }
+            f.instruction(&End);
+        }
+        MdOp::Mul | MdOp::Mulw => unreachable!(),
+    }
+    store_reg(f, rd);
+}
+
+/// With the operands in locals 4 (a) and 5 (b), leave mulhu(a, b) — the high
+/// 64 bits of the unsigned 128-bit product — on the stack. Four 32x32->64
+/// partial products with carry propagation, the same algorithm as TinyEMU's
+/// non-int128 mulhu fallback (whose carry handling is correct; only its mulh
+/// sign-correction wrapper is buggy, and that path is dead under
+/// HAVE_INT128 anyway). Clobbers locals 1, 2, 4, 5.
+fn mulhu_core(f: &mut Function) {
+    use Instruction::*;
+    const M: i64 = 0xffff_ffff;
+    // l1 = r01 = (a & M) * (b >> 32)
+    f.instruction(&LocalGet(4));
+    f.instruction(&I64Const(M));
+    f.instruction(&I64And);
+    f.instruction(&LocalGet(5));
+    f.instruction(&I64Const(32));
+    f.instruction(&I64ShrU);
+    f.instruction(&I64Mul);
+    f.instruction(&LocalSet(1));
+    // l2 = r10 = (a >> 32) * (b & M)
+    f.instruction(&LocalGet(4));
+    f.instruction(&I64Const(32));
+    f.instruction(&I64ShrU);
+    f.instruction(&LocalGet(5));
+    f.instruction(&I64Const(M));
+    f.instruction(&I64And);
+    f.instruction(&I64Mul);
+    f.instruction(&LocalSet(2));
+    // stack: r00 >> 32 = ((a & M) * (b & M)) >> 32
+    f.instruction(&LocalGet(4));
+    f.instruction(&I64Const(M));
+    f.instruction(&I64And);
+    f.instruction(&LocalGet(5));
+    f.instruction(&I64Const(M));
+    f.instruction(&I64And);
+    f.instruction(&I64Mul);
+    f.instruction(&I64Const(32));
+    f.instruction(&I64ShrU);
+    // l4 = r11 = (a >> 32) * (b >> 32)   (a dead from here on)
+    f.instruction(&LocalGet(4));
+    f.instruction(&I64Const(32));
+    f.instruction(&I64ShrU);
+    f.instruction(&LocalGet(5));
+    f.instruction(&I64Const(32));
+    f.instruction(&I64ShrU);
+    f.instruction(&I64Mul);
+    f.instruction(&LocalSet(4));
+    // c = (r00 >> 32) + (r01 & M) + (r10 & M)
+    f.instruction(&LocalGet(1));
+    f.instruction(&I64Const(M));
+    f.instruction(&I64And);
+    f.instruction(&I64Add);
+    f.instruction(&LocalGet(2));
+    f.instruction(&I64Const(M));
+    f.instruction(&I64And);
+    f.instruction(&I64Add);
+    // l5 = c2 = (c >> 32) + (r01 >> 32) + (r10 >> 32) + (r11 & M)   (b dead)
+    f.instruction(&I64Const(32));
+    f.instruction(&I64ShrU);
+    f.instruction(&LocalGet(1));
+    f.instruction(&I64Const(32));
+    f.instruction(&I64ShrU);
+    f.instruction(&I64Add);
+    f.instruction(&LocalGet(2));
+    f.instruction(&I64Const(32));
+    f.instruction(&I64ShrU);
+    f.instruction(&I64Add);
+    f.instruction(&LocalGet(4));
+    f.instruction(&I64Const(M));
+    f.instruction(&I64And);
+    f.instruction(&I64Add);
+    f.instruction(&LocalTee(5));
+    // result = ((c2 >> 32) + (r11 >> 32)) << 32 | (c2 & M)
+    f.instruction(&I64Const(32));
+    f.instruction(&I64ShrU);
+    f.instruction(&LocalGet(4));
+    f.instruction(&I64Const(32));
+    f.instruction(&I64ShrU);
+    f.instruction(&I64Add);
+    f.instruction(&I64Const(32));
+    f.instruction(&I64Shl);
+    f.instruction(&LocalGet(5));
+    f.instruction(&I64Const(M));
+    f.instruction(&I64And);
+    f.instruction(&I64Or);
 }
 
 /// Emit the shared front half of an inline TLB probe: compute the effective

@@ -337,15 +337,29 @@ fn main() -> Result<()> {
             table.size(&store)
         );
     }
-    // Memory helpers (Batch 4+ builds): all 11 or none. Without them, blocks
-    // containing loads/stores fail registration and fall back to interpreting.
-    let helpers: Option<Vec<Func>> = codegen::MEM_HELPER_EXPORTS
+    // Memory helpers (Batch 4+ builds): the 11 base load/store helpers are
+    // all-or-none; the atomics pair (Batch 4.5) is optional on top — absent
+    // on older guests, whose blocks then never contain AMO ops anyway.
+    // Without the base set, blocks containing loads/stores fail registration
+    // and fall back to interpreting.
+    let base: Option<Vec<Func>> = codegen::MEM_HELPER_EXPORTS[..codegen::BASE_HELPERS]
         .iter()
         .map(|n| instance.get_func(&mut store, n))
         .collect();
-    if let Some(h) = helpers {
+    if let Some(mut h) = base {
+        let amo: Option<Vec<Func>> = codegen::MEM_HELPER_EXPORTS[codegen::BASE_HELPERS..]
+            .iter()
+            .map(|n| instance.get_func(&mut store, n))
+            .collect();
+        let have_amo = amo.is_some();
+        if let Some(a) = amo {
+            h.extend(a);
+        }
         store.data_mut().mem_helpers = Some(h);
-        eprintln!("[jit-host] guest exports mem helpers: load/store codegen enabled");
+        eprintln!(
+            "[jit-host] guest exports mem helpers: load/store codegen enabled{}",
+            if have_amo { " (+ atomics)" } else { "" }
+        );
     }
     // TLB layout (Batch 5+ builds): pure constant-returning export, safe to
     // call before _start. The query is selector-keyed; sanity-check the
@@ -450,7 +464,9 @@ fn register_block_inner(
     // Debugging: env-var filters to reject specific op classes.
     // JIT_NO_BRANCH=1   skips blocks whose last op is a conditional branch.
     // JIT_NO_JUMP=1     skips blocks whose last op is JAL/JALR.
-    // JIT_NO_MEM=1      skips blocks containing any load/store.
+    // JIT_NO_MEM=1      skips blocks containing any load/store/atomic.
+    // JIT_NO_MULDIV=1   skips blocks containing any RV64M op.
+    // JIT_NO_AMO=1      skips blocks containing any atomic.
     if !ir_bytes.is_empty() {
         let last_kind = ir_bytes[ir_bytes.len() - 16];
         if std::env::var_os("JIT_NO_BRANCH").is_some() && (32..=37).contains(&last_kind) {
@@ -460,9 +476,21 @@ fn register_block_inner(
             return Err(Error::msg("JIT_NO_JUMP: skipping jump terminator"));
         }
         if std::env::var_os("JIT_NO_MEM").is_some()
-            && ir_bytes.chunks_exact(16).any(|c| (38..=48).contains(&c[0]))
+            && ir_bytes
+                .chunks_exact(16)
+                .any(|c| (38..=48).contains(&c[0]) || (62..=63).contains(&c[0]))
         {
             return Err(Error::msg("JIT_NO_MEM: skipping block with memory ops"));
+        }
+        if std::env::var_os("JIT_NO_MULDIV").is_some()
+            && ir_bytes.chunks_exact(16).any(|c| (49..=61).contains(&c[0]))
+        {
+            return Err(Error::msg("JIT_NO_MULDIV: skipping block with RV64M ops"));
+        }
+        if std::env::var_os("JIT_NO_AMO").is_some()
+            && ir_bytes.chunks_exact(16).any(|c| (62..=63).contains(&c[0]))
+        {
+            return Err(Error::msg("JIT_NO_AMO: skipping block with atomics"));
         }
     }
 
@@ -548,7 +576,12 @@ fn register_block_inner(
             let helpers = caller.data().mem_helpers.as_ref().ok_or_else(|| {
                 Error::msg("block uses memory ops but guest exports no c2w_jit_* helpers")
             })?;
-            v.extend(used_helpers.iter().map(|&h| Extern::Func(helpers[h])));
+            for &h in &used_helpers {
+                let func = helpers.get(h).copied().ok_or_else(|| {
+                    Error::msg("block uses an atomic but guest exports no c2w_jit_amo_* helpers")
+                })?;
+                v.push(Extern::Func(func));
+            }
         }
         v
     };
