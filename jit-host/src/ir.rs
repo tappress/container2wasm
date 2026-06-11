@@ -131,7 +131,9 @@ pub enum Op {
     Srlw { rd: u32, rs1: u32, rs2: u32 },
     Sraw { rd: u32, rs1: u32, rs2: u32 },
     // Terminators. end_pc (passed to build_block) serves as both link_pc
-    // (JAL/JALR) and fallthrough_pc (Bxx) — they're always pc_term + 4.
+    // (JAL/JALR) and fallthrough_pc (Bxx) — always pc_term + insn length,
+    // which the scanner tracks (4, or 2 for the compressed forms c.j / c.jr
+    // / c.jalr / c.beqz / c.bnez — Batch 7 expands RV-C to these same kinds).
     Jal { rd: u32, target_pc: i64 },
     Jalr { rd: u32, rs1: u32, imm: i64 },
     Beq { rs1: u32, rs2: u32, target_pc: i64 },

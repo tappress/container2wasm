@@ -296,7 +296,7 @@ RUN git clone https://github.com/bytecodealliance/wizer && \
 COPY --link --from=tinyemu-repo / /tinyemu
 WORKDIR /tinyemu
 ARG JIT_DISPATCH_VARIANT=0
-ARG JIT_HOT_THRESHOLD=128
+ARG JIT_HOT_THRESHOLD=512
 RUN --mount=type=cache,id=tinyemu-ccache-wasi,target=/root/.ccache \
     make -j $(nproc) -f Makefile \
     CONFIG_FS_NET= CONFIG_SDL= CONFIG_INT128= CONFIG_X86EMU= CONFIG_SLIRP= \
