@@ -1,0 +1,113 @@
+<html>
+  <head>
+    <title>container + WASI on browser</title>
+    <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/xterm@4.17.0/css/xterm.css">
+  </head>
+  <body>
+    <div id="terminal"></div>
+    <script src="https://cdn.jsdelivr.net/npm/xterm@4.17.0/lib/xterm.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/xterm-pty@0.9.4/index.js"></script>
+    <script src="./stack.js"></script>
+    <script src="./ws-delegate.js"></script>
+    <script>
+      const xterm = new Terminal();
+      xterm.open(document.getElementById("terminal"));
+
+      const { master, slave } = openpty();
+
+      termios = slave.ioctl("TCGETS");
+      termios.iflag &= ~(/*IGNBRK | BRKINT | PARMRK |*/ ISTRIP | INLCR | IGNCR | ICRNL | IXON);
+      termios.oflag &= ~(OPOST);
+      termios.lflag &= ~(ECHO | ECHONL | ICANON | ISIG | IEXTEN);
+      //termios.cflag &= ~(CSIZE | PARENB);
+      //termios.cflag |= CS8;
+      slave.ioctl("TCSETS", new Termios(termios.iflag, termios.oflag, termios.cflag, termios.lflag, termios.cc));
+      xterm.loadAddon(master);
+      const worker = new Worker("./worker.js"+location.search);
+
+      // Benchmark plumbing: relay the worker's result object to the page
+      // (window.__c2wResult, console), auto-POST it to the host collector on
+      // :8081 when ?post= is set, and chain to the next suite step when
+      // ?step=N is set (suite.json holds one query string per step). A
+      // watchdog posts a timeout marker and moves on if the run hangs.
+      window.__c2wResult = null;
+      var q = new URLSearchParams(location.search);
+      var postTag = q.get('post');
+      var stepParam = q.get('step');
+      var watchdogMs = parseInt(q.get('watchdog') || '900000');
+      var finished = false;
+      function gotoNext() {
+          if (stepParam === null) return;
+          fetch('/suite.json').then(r => r.json()).then(suite => {
+              var n = parseInt(stepParam) + 1;
+              if (n < suite.length) {
+                  setTimeout(() => { location.href = '/?' + suite[n]; }, 1500);
+              } else {
+                  document.title = 'SUITE DONE';
+                  console.log('C2W_SUITE_DONE');
+              }
+          });
+      }
+      function finish(result) {
+          if (finished) return;
+          finished = true;
+          var p = Promise.resolve();
+          if (postTag !== null) {
+              p = fetch('http://localhost:8081/result?tag=' + encodeURIComponent(postTag), {
+                  method: 'POST', mode: 'cors',
+                  headers: { 'Content-Type': 'text/plain' },
+                  body: JSON.stringify(result),
+              }).catch(() => {});
+          }
+          p.then(gotoNext);
+      }
+      worker.addEventListener('message', (e) => {
+          if (e.data && e.data.type === 'c2w-result') {
+              window.__c2wResult = e.data.result;
+              console.log('C2W_RESULT_PAGE ' + JSON.stringify(e.data.result));
+              finish(e.data.result);
+          }
+      });
+      if (postTag !== null) {
+          setTimeout(() => finish({ error: 'watchdog timeout', href: location.href }), watchdogMs);
+      }
+      document.addEventListener('DOMContentLoaded', () => {
+          var btn = document.createElement('button');
+          btn.textContent = 'Copy result JSON';
+          btn.style.cssText = 'position:fixed;top:4px;right:4px;z-index:10';
+          btn.onclick = () => navigator.clipboard.writeText(JSON.stringify(window.__c2wResult));
+          document.body.appendChild(btn);
+      });
+
+      var nwStack;
+      var netParam = getNetParam();
+      var imgParam = new URLSearchParams(location.search).get('img');
+      var workerImage = location.origin + "/" + (imgParam || "out.wasm");
+      if (netParam) {
+          if (netParam.mode == 'delegate') {
+              nwStack = delegate(worker, workerImage, netParam.param);
+          } else if (netParam.mode == 'browser') {
+              nwStack = newStack(worker, workerImage, new Worker("./stack-worker.js"+location.search), location.origin + "/c2w-net-proxy.wasm");
+          }
+      }
+      if (!nwStack) {
+          worker.postMessage({type: "init", imagename: workerImage});
+      }
+      new TtyServer(slave).start(worker, nwStack);
+
+      function getNetParam() {
+          var vars = location.search.substring(1).split('&');
+          for (var i = 0; i < vars.length; i++) {
+              var kv = vars[i].split('=');
+              if (decodeURIComponent(kv[0]) == 'net') {
+                  return {
+                      mode: kv[1],
+                      param: kv[2],
+                  };
+              }
+          }
+          return null;
+      }
+    </script>
+  </body>
+</html>

@@ -560,3 +560,30 @@ All outputs correct, reg_fail=0. Chain beats nochain on the loop in 3/3 rounds (
 **Verdict**: opt-in via `JIT_CHAIN=1` (like `JIT_INLINE_TLB`), fully tested and kept working. Re-evaluate (a) once async compile takes cranelift off the critical path — chaining's loop win would then stand alone, and (b) at browser-port time, where compile (Liftoff) is cheaper and call costs differ. The "longer regions" idea survives in a different form: superblock/trace compilation (fewer, longer blocks) attacks entry overhead without per-exit probe work — but it's Tier 3 phase 2 territory.
 
 **Consequence for the plan**: with coverage (B4.5) and transition cost (B8) both measured to their ceilings, **async/background compile is now unambiguously the top lever** — hello's entire 1.0s gap to jit0 and most of echo's 1.6s gap is cranelift-on-critical-path. After that, the browser-worker port checkpoint (now 5 batches overdue) before any further wasmtime-side tuning.
+
+#### Browser-port checkpoint result (2026-06-11, evening): JIT runs correct in V8 — and the two wasmtime-shelved optimizations flip to wins. First config to beat the interpreter: inline TLB (+ chaining) in the browser
+
+**What was built** (committed this session; runtime scaffold lives in /tmp/out-browser, recipe in [browser-bench/README.md](browser-bench/README.md)):
+- **[jit-codegen-wasm/](jit-codegen-wasm/)** — the existing jit-host codegen compiled to wasm32-unknown-unknown via `#[path]` includes of the same codegen.rs/ir.rs (byte-identical block output, no hand-port), behind a C-ABI surface (`jcg_in_ptr`/`jcg_build`/`jcg_out_ptr`/`jcg_set_tlb`/`jcg_set_chain`). 173KB, no wasm-bindgen.
+- **JS coordinator** ([browser-bench/htdocs/worker.js](browser-bench/htdocs/worker.js)) — provides the `jit.*` imports in the scaffold worker. `register_block2`: read IR from guest memory → content cache (pc, end_pc, n_insns, IR bytes) → codegen wasm → **sync `new WebAssembly.Module`** (legal in workers) → instantiate against the guest's exported memory/`__indirect_function_table`/helper funcs (named imports — no positional juggling) → `table.grow`+`table.set` → return slot. `flush_blocks`/`mark_uncompilable` are stats-only counters — the gen-counter invalidation design (Batch 3.5) needed zero changes for the JS host, as intended. `c2w_blk.read/write` stubbed returning −1. Layout selectors 0-6 (TLB) and 7-20 (chain + ack) queried pre-`_start` exactly like main.rs. URL params: `cmd`/`cmd64` (container command), `img` (artifact), `jit=off`, `chain=on`, `tlb=on`.
+- **Bench harness** — page auto-POSTs one result JSON per run (wallclock split fetch/instantiate/run, compile counters, chainHops read from guest memory at exit, output tail for correctness) to [browser-bench/collector.py](browser-bench/collector.py) on :8081; chains through suite.json steps with a watchdog. Fully autonomous A/B loops.
+- **Driving**: full Chrome (system + Playwright-bundled) hangs at startup in this WSL2 — `chrome-headless-shell` works and is real V8 (same Liftoff/TurboFan tiering), so all numbers below are headless-shell. Page also works in headed Chrome (user-verified window).
+
+**Numbers** (medians, n=2-4 interleaved rounds, same box/session; artifacts: jit0 = true interp, jit7c = Batch 8; all 32 runs output-correct, exit 0, regFail=0):
+
+| Config | echo hi | node hello | 1e8 loop |
+|---|---|---|---|
+| interp (jit0) | **1.50s** | **11.73s** | 76.92s |
+| jit (default = helper-call mem, no chain) | 1.94s | 12.62s | 80.48s |
+| jit + tlb=on | — | 12.29s | 73.39s |
+| jit + chain=on | — | 12.43s | 78.90s |
+| jit + chain+tlb | — | 12.81s | **72.75s** |
+
+Median compile cost: echo 0.20s, hello 0.39s, loop 0.55-0.60s. Browser interp ≈ wasmtime interp (hello 11.7 vs 10-13; loop 76.9 vs 68-78). Browser JIT-config numbers are strikingly stable (loop-tlb: 73.2/73.3/73.5/73.7 across 4 runs spanning 20 min) while interp drifted 75.1→82.5 — compiled-block timing is evidently less sensitive to whatever WSL2 box state does to the interpreter.
+
+**The three load-bearing findings**:
+1. **V8 compile is ~5× cheaper than cranelift** (~0.18ms vs ~0.85ms per module; hello total compile 0.39s vs 2.86s). The "async compile is the top lever" conclusion from Batch 8 is **wasmtime-specific** — in the browser (the actual product target) compile-on-critical-path is already a non-issue. Async compile drops from "unambiguously next" to "wasmtime-only nicety".
+2. **Inline TLB flips from net-loss to the first JIT-beats-interpreter result** (loop 73.4 vs 76.9 interp; also best single config on hello). V8's cross-instance wasm→wasm calls are expensive enough that inlining the probe pays — the exact reason Batch 5 kept the code opt-in for browser re-evaluation. **Chaining also flips** on the loop (and stacks: chain+tlb 72.75 = best, 1.02B hops engaged) though it hurts boot-heavy hello when combined (12.81 vs tlb-alone 12.29 — epilogue probe-misses on cold code). **Browser defaults should be: tlb=on always, chain=on for compute-heavy** (wasmtime defaults unchanged).
+3. **Honest overall state in the target environment**: best-config JIT beats interp ~5% on the hot loop, loses ~4% on hello and ~30% on echo. The remaining echo/hello gap is *not* compile (0.2-0.4s) — it's miss-path overhead (map+gate lookups on once-through boot code) and compiled code still running at ≤ interpreter parity per-insn under V8 too. Same per-insn-parity wall as wasmtime: getting past it needs better compiled code (register lifting / Batch 6, superblocks), not cheaper transitions — those are now cheap everywhere.
+
+**Next levers, reordered for the browser target**: (1) per-insn quality of compiled code — Batch 6 register lifting is unparked now that compile is cheap and blocks are 4-6 insns with TLB inlined; (2) superblock/longer regions to amortize entry overhead; (3) miss-path cost on boot code (cheaper gate/map probe, or higher JIT_HOT_THRESHOLD in browser builds). Wasmtime-side async compile is deprioritized — measure in browser first from now on, since both backends have now disagreed twice (TLB, chaining) on what's worth doing.

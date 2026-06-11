@@ -3,3 +3,4 @@ out.wasm
 
 # Rust JIT host embedder build artifacts
 /jit-host/target/
+/jit-codegen-wasm/target/
