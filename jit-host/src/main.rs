@@ -57,6 +57,11 @@ struct HostState {
     /// compiled block's Func and returns the slot index; the guest then calls
     /// blocks via call_indirect without ever crossing back into the host.
     guest_table: Option<Table>,
+    /// TLB layout from the guest's `c2w_jit_tlb_layout` export, used only
+    /// when JIT_INLINE_TLB=1 opts in (Batch 5 measured the inline probe as a
+    /// net loss under wasmtime — see codegen::TlbLayout). None = helper-call
+    /// mem codegen, the default.
+    tlb_layout: Option<codegen::TlbLayout>,
     /// Raises wasmtime's default 10k-instances-per-store cap — every unique
     /// compiled block is an instance, and V8's self-modifying code mints new
     /// unique content continuously, so Node workloads blow past 10k.
@@ -302,6 +307,7 @@ fn main() -> Result<()> {
         guest_memory: None,
         mem_helpers: None,
         guest_table: None,
+        tlb_layout: None,
         n_register_ok: 0,
         n_register_fail: 0,
         n_cache_hit: 0,
@@ -340,6 +346,42 @@ fn main() -> Result<()> {
     if let Some(h) = helpers {
         store.data_mut().mem_helpers = Some(h);
         eprintln!("[jit-host] guest exports mem helpers: load/store codegen enabled");
+    }
+    // TLB layout (Batch 5+ builds): pure constant-returning export, safe to
+    // call before _start. The query is selector-keyed; sanity-check the
+    // power-of-two assumptions the codegen bakes in as shifts/masks.
+    // Opt-in: same-day A/B on this box showed the inline probe losing to the
+    // plain helper call (loop 70.9s vs 68.5s) — wasmtime's cross-module call
+    // is a few ns, cheaper than duplicating the probe in every block.
+    if std::env::var_os("JIT_INLINE_TLB").is_none() {
+        // default: helper-call mem codegen
+    } else if let Ok(q) =
+        instance.get_typed_func::<i32, i32>(&mut store, "c2w_jit_tlb_layout")
+    {
+        let g = |store: &mut Store<HostState>, k: i32| -> Result<u32> {
+            Ok(q.call(store, k)? as u32)
+        };
+        let tlb_size = g(&mut store, 2)?;
+        let entry_size = g(&mut store, 3)?;
+        if !tlb_size.is_power_of_two() || !entry_size.is_power_of_two() {
+            return Err(Error::msg(format!(
+                "c2w_jit_tlb_layout: TLB_SIZE {tlb_size} / sizeof(TLBEntry) {entry_size} not powers of two"
+            )));
+        }
+        let layout = codegen::TlbLayout {
+            tlb_read_off: g(&mut store, 0)?,
+            tlb_write_off: g(&mut store, 1)?,
+            idx_mask: tlb_size - 1,
+            entry_shift: entry_size.trailing_zeros(),
+            vaddr_off: g(&mut store, 4)?,
+            addend_off: g(&mut store, 5)?,
+            pg_shift: g(&mut store, 6)?,
+        };
+        eprintln!(
+            "[jit-host] guest exports TLB layout (read@{} write@{} entries={} esz={} pg=2^{}): inline-TLB codegen enabled",
+            layout.tlb_read_off, layout.tlb_write_off, tlb_size, entry_size, layout.pg_shift
+        );
+        store.data_mut().tlb_layout = Some(layout);
     }
     let start = instance.get_typed_func::<(), ()>(&mut store, "_start")?;
     let run_result = start.call(&mut store, ());
@@ -461,7 +503,8 @@ fn register_block_inner(
             }
         });
     }
-    let (bytes, used_helpers) = codegen::build_block(&ir_bytes, pc, end_pc);
+    let tlb = caller.data().tlb_layout;
+    let (bytes, used_helpers) = codegen::build_block(&ir_bytes, pc, end_pc, tlb.as_ref());
     // JIT_DUMP_PCS=11eb0,ffffffff8002561a,... — dump IR+wasm for specific PCs
     // (hex, no 0x prefix needed) at registration time.
     if let Ok(pcs_str) = std::env::var("JIT_DUMP_PCS") {

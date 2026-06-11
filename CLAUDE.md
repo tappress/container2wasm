@@ -486,3 +486,31 @@ All outputs correct, reg_fail=0. Batch 7 beats Batch 4 same-day on hello (−1.3
 4. Echo stays interp-favored until compile cost leaves the critical path (async compile remains the lever; 1.4s of echo's 4.2s is cranelift).
 
 **Next**: Batch 5 (inline TLB), then chaining, then re-evaluate Batch 6/8. MUL/DIV + atomics (LR/SC/AMO) are the next coverage terminators worth folding in along the way (V8 emits both heavily).
+
+#### Batch 5 result (2026-06-11): inline TLB lands correct — and measures as a net LOSS; shelved to opt-in. Two cost-model corrections come out of it
+
+**What was built** (tinyemu-c2w this commit, container2wasm this commit): compiled blocks probe TinyEMU's live TLB inline — same tag compare as the C macros (`vaddr == addr & ~(PG_MASK & ~(bytes-1))`, alignment folded in), hit ⇒ direct load/store on the imported linear memory at `mem_addend + wrap32(addr)`, miss ⇒ the Batch 4 helper call (which refills via the slow path). Correct by construction: it reads the same live entries the interpreter uses (tlb_flush writes vaddr=-1 into those very words; entries are only ever installed for RAM pages, so MMIO can't hit the fast path; write-entry install happens on a slow-path store that already set the dirty bit). Zero IR changes — re-link cache and content-cache keys unaffected. Plumbing: new guest export `c2w_jit_tlb_layout(selector)` (offsets of tlb_read/tlb_write, TLB_SIZE, TLBEntry size/field offsets, PG_SHIFT — selector-keyed so additions can't break older hosts); host queries it once at startup and bakes shifts/masks into block codegen. 4 new semantic tests (hit-skips-helper incl. addend arithmetic, miss-falls-back, misaligned-forces-miss, miss-fault-bails). All 3 workloads produce correct output, reg_fail=0.
+
+**Numbers (same-session, 3-run medians + decisive single-run A/B on the same jit5 artifact)**:
+
+| Config | echo | hello | loop |
+|---|---|---|---|
+| jit0 (true interp) | 1.7s | 11.4s | 68.5s |
+| jit7 (Batch 7 artifact) | 2.9s | 11.7s | 68.6s |
+| jit5, inline TLB ON (now opt-in `JIT_INLINE_TLB=1`) | 3.0s | 12.8s | 70.9s |
+| jit5, helper calls (now the default) | — | — | **68.5s** |
+| jit5, `JIT_NO_MEM` (no mem codegen) | — | — | 72.4s |
+
+The A/B pins it: same artifact, the probe codegen alone costs +2.0s execution +0.4s compile on the loop (and +1.1s on hello). The miss-rate explanation is excluded by the NOMEM row — if inline probes missed, the helpers' bit-identical C probe would miss too and mem ops would go through the page walker at 50-100ns each, tens of seconds slower; instead helper-shape mem codegen is worth ~4s net. Probes hit; the win just isn't there.
+
+**Correction 1 — the mem-op cost model was wrong.** Batch 7's decomposition attributed ~20ns to each wasm→wasm helper call; the real cross-module call cost under wasmtime is a few ns. Eliminating it cannot pay for ~30 extra wasm ops of probe per mem op across ~3.2k blocks (icache + regalloc + ~15% more cranelift time) versus one shared clang-optimized helper that stays icache-resident. Batch 7's "7-8.5ns per compiled insn ⇒ mem helpers dominate" arithmetic is retracted; per-op micro-costs are smaller and flatter than modeled. Inline TLB is now opt-in (`JIT_INLINE_TLB=1`), kept tested-and-working for the browser port, where an engine with expensive cross-instance calls would flip the calculus back.
+
+**Correction 2 — the box invalidates ratios *within* a day.** This morning's Batch 7 medians: jit0 78.7s / jit7 89.4s (0.88×). This afternoon, same artifacts, same harness, same script: jit0 68.5s / jit7 68.6s (1.00×). Compile_ms also halved (3.6s → 2.8s). WSL2 box state shifts both absolute speed AND relative ratios between JIT and interpreter builds. Methodology from now on: conclusions only from same-session A/B with all configs interleaved, and effects under ~5-10% are treated as unresolved on this box regardless of medians.
+
+**Honest current state (this session)**: loop and hello at parity with the true interpreter (the morning's "JIT loses everywhere" was partly box state); echo still 1.7× behind on compile cost (2.1s of echo's 3.0s is cranelift).
+
+**Consequences for the plan**: with per-mem-op cost off the table, the remaining gap drivers are (a) compile cost on the critical path — dominant on echo and the first seconds of every workload, (b) block entry/dispatch overhead × 4-6-insn blocks — ~2.1B dispatch decisions per loop run, (c) coverage terminators. Reordered next steps:
+1. **Coverage: MUL/DIV + atomics (LR/SC/AMO)** — cheap to add, V8 emits both heavily, and longer blocks amortize entry overhead (attacks (b) and (c) together).
+2. **Block chaining / longer regions** (Q2) — direct attack on (b).
+3. **Async/background compile** — takes (a) off the guest's critical path; echo's lever.
+4. Register lifting (Batch 6) stays parked until blocks are longer; inline TLB re-evaluated at browser-port time.

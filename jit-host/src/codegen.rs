@@ -32,6 +32,43 @@ pub const MEM_HELPER_EXPORTS: [&str; 11] = [
     "c2w_jit_sd",
 ];
 
+/// TLB layout constants read once from the guest's `c2w_jit_tlb_layout`
+/// export (Batch 5). All offsets are byte offsets in the guest's linear
+/// memory: tlb_read_off/tlb_write_off relative to the state pointer,
+/// vaddr_off/addend_off relative to a TLBEntry base. Present = memory ops
+/// compile to an inline probe of the live TLB with the helper call demoted
+/// to the miss path; absent = helper-call-only shape, the Batch 4 codegen.
+///
+/// OPT-IN ONLY (JIT_INLINE_TLB=1): measured a net LOSS under wasmtime —
+/// loop 70.9s inline vs 68.5s helper-only, same artifact, same day. The
+/// probe hits (the helpers' identical C probe demonstrably hits), but the
+/// cross-module call it eliminates costs only a few ns while the inlined
+/// probe adds ~30 wasm ops per mem op across thousands of blocks (icache +
+/// compile time) versus one shared clang-optimized helper. Kept for the
+/// browser port, where engine call costs may price this differently.
+#[derive(Clone, Copy, Debug)]
+pub struct TlbLayout {
+    pub tlb_read_off: u32,
+    pub tlb_write_off: u32,
+    /// TLB_SIZE - 1 (TLB_SIZE asserted power of two by the caller).
+    pub idx_mask: u32,
+    /// log2(sizeof(TLBEntry)).
+    pub entry_shift: u32,
+    pub vaddr_off: u32,
+    pub addend_off: u32,
+    pub pg_shift: u32,
+}
+
+/// The fast-path tag the C macros compare against:
+/// `addr & ~(PG_MASK & ~(bytes - 1))`. Page bits select the entry; the kept
+/// low bits make any access misaligned for its width fail the compare (TLB
+/// vaddrs are page-aligned), so the fast path only ever sees naturally
+/// aligned RAM accesses.
+fn tag_mask(pg_shift: u32, bytes: u64) -> i64 {
+    let pg_mask = (1u64 << pg_shift) - 1;
+    !(pg_mask & !(bytes - 1)) as i64
+}
+
 /// Helper-import identity of a memory op, or None for non-memory ops.
 fn helper_id(op: &Op) -> Option<usize> {
     match *op {
@@ -60,6 +97,7 @@ struct Ctx {
     start_pc: u64,
     block_end_pc: u64,
     helper_import_idx: [Option<u32>; 11],
+    tlb: Option<TlbLayout>,
 }
 
 /// Build a wasm module containing one exported function "block" with signature
@@ -73,7 +111,12 @@ struct Ctx {
 /// Returns the module bytes plus the helper ids the block imports, in import
 /// order — the caller must pass exactly those guest funcs (after the memory)
 /// to instantiation.
-pub fn build_block(ir: &[u8], start_pc: u64, block_end_pc: u64) -> (Vec<u8>, Vec<usize>) {
+pub fn build_block(
+    ir: &[u8],
+    start_pc: u64,
+    block_end_pc: u64,
+    tlb: Option<&TlbLayout>,
+) -> (Vec<u8>, Vec<usize>) {
     let ops = parse_ir(ir);
 
     // Which memory helpers does this block use? Imports are declared only
@@ -140,12 +183,13 @@ pub fn build_block(ir: &[u8], start_pc: u64, block_end_pc: u64) -> (Vec<u8>, Vec
         start_pc,
         block_end_pc,
         helper_import_idx,
+        tlb: tlb.copied(),
     };
 
-    // Code. One i64 local (idx 1) used by JALR codegen to stash new_pc before
-    // performing the link-register write (avoids rs1 == rd hazard).
+    // Code. Locals: 1 (i64) = JALR new_pc stash (avoids rs1 == rd hazard),
+    // 2 (i64) = mem-op effective address, 3 (i32) = TLB entry pointer.
     let mut codes = CodeSection::new();
-    let mut f = Function::new(vec![(1, ValType::I64)]);
+    let mut f = Function::new(vec![(2, ValType::I64), (1, ValType::I32)]);
     let ends_with_terminator = ops.last().map(Op::is_terminator).unwrap_or(false);
     emit_ops(&mut f, &ops, &ctx);
     // Non-terminator block: fall through to the static end-PC constant.
@@ -395,34 +439,156 @@ fn emit_one(f: &mut Function, op: &Op, ctx: &Ctx) {
         Bltu { rs1, rs2, target_pc } => branch(f, rs1, rs2, target_pc, block_end_pc, &Instruction::I64LtU),
         Bgeu { rs1, rs2, target_pc } => branch(f, rs1, rs2, target_pc, block_end_pc, &Instruction::I64GeU),
 
-        // Memory ops: call the imported guest helper, which performs the
-        // access (TLB fast path inline in the guest module) including rd
-        // writeback for loads. Helper returns nonzero on MMU fault — the
-        // block then bails with the faulting insn's pc, tagged with bit 0 so
-        // the interpreter re-executes that insn and raises the exception.
-        Load { w: _, rd, rs1, imm, pc_off } => {
-            f.instruction(&Instruction::LocalGet(0)); // state
-            load_reg(f, rs1);
-            f.instruction(&Instruction::I64Const(imm));
-            f.instruction(&Instruction::I64Add); // addr
-            f.instruction(&Instruction::I32Const(rd as i32)); // rd_off, 0 = x0
-            f.instruction(&Instruction::Call(
-                ctx.helper_import_idx[helper_id(op).unwrap()].unwrap(),
-            ));
-            fault_check(f, ctx.start_pc + pc_off as u64);
+        // Memory ops. With a TlbLayout (Batch 5): probe the guest's live TLB
+        // inline — tag hit means a naturally aligned RAM access, performed
+        // directly on the imported memory; miss falls back to the helper.
+        // Without one: call the helper unconditionally (Batch 4 shape). The
+        // helper performs the full insn semantics including rd writeback and
+        // returns nonzero on MMU fault — the block then bails with the
+        // faulting insn's pc, tagged with bit 0 so the interpreter
+        // re-executes that insn and raises the exception. The inline fast
+        // path cannot fault: a live TLB entry proves the page is mapped RAM
+        // with this access type permitted.
+        Load { w, rd, rs1, imm, pc_off } => {
+            let fault_pc = ctx.start_pc + pc_off as u64;
+            let helper = ctx.helper_import_idx[helper_id(op).unwrap()].unwrap();
+            if let Some(t) = ctx.tlb {
+                let bytes = match w {
+                    LoadW::B | LoadW::Bu => 1,
+                    LoadW::H | LoadW::Hu => 2,
+                    LoadW::W | LoadW::Wu => 4,
+                    LoadW::D => 8,
+                };
+                tlb_probe(f, t, rs1, imm, t.tlb_read_off, bytes);
+                f.instruction(&Instruction::If(BlockType::Empty));
+                // Fast: value = mem[addend + wrap32(addr)], width-extended.
+                if rd != 0 {
+                    f.instruction(&Instruction::LocalGet(0)); // writeback base
+                }
+                tlb_host_addr(f, t, t.tlb_read_off);
+                let arg = |align| MemArg { offset: 0, align, memory_index: 0 };
+                f.instruction(&match w {
+                    LoadW::B => Instruction::I64Load8S(arg(0)),
+                    LoadW::Bu => Instruction::I64Load8U(arg(0)),
+                    LoadW::H => Instruction::I64Load16S(arg(1)),
+                    LoadW::Hu => Instruction::I64Load16U(arg(1)),
+                    LoadW::W => Instruction::I64Load32S(arg(2)),
+                    LoadW::Wu => Instruction::I64Load32U(arg(2)),
+                    LoadW::D => Instruction::I64Load(arg(3)),
+                });
+                if rd != 0 {
+                    store_reg(f, rd);
+                } else {
+                    // Load to x0: the access architecturally has no effect on
+                    // RAM; we still perform it to stay shaped like the helper.
+                    f.instruction(&Instruction::Drop);
+                }
+                f.instruction(&Instruction::Else);
+                f.instruction(&Instruction::LocalGet(0)); // state
+                f.instruction(&Instruction::LocalGet(2)); // addr
+                f.instruction(&Instruction::I32Const(rd as i32)); // rd_off, 0 = x0
+                f.instruction(&Instruction::Call(helper));
+                fault_check(f, fault_pc);
+                f.instruction(&Instruction::End);
+            } else {
+                f.instruction(&Instruction::LocalGet(0)); // state
+                load_reg(f, rs1);
+                f.instruction(&Instruction::I64Const(imm));
+                f.instruction(&Instruction::I64Add); // addr
+                f.instruction(&Instruction::I32Const(rd as i32)); // rd_off, 0 = x0
+                f.instruction(&Instruction::Call(helper));
+                fault_check(f, fault_pc);
+            }
         }
-        Store { w: _, rs1, rs2, imm, pc_off } => {
-            f.instruction(&Instruction::LocalGet(0)); // state
-            load_reg(f, rs1);
-            f.instruction(&Instruction::I64Const(imm));
-            f.instruction(&Instruction::I64Add); // addr
-            load_reg(f, rs2); // val
-            f.instruction(&Instruction::Call(
-                ctx.helper_import_idx[helper_id(op).unwrap()].unwrap(),
-            ));
-            fault_check(f, ctx.start_pc + pc_off as u64);
+        Store { w, rs1, rs2, imm, pc_off } => {
+            let fault_pc = ctx.start_pc + pc_off as u64;
+            let helper = ctx.helper_import_idx[helper_id(op).unwrap()].unwrap();
+            if let Some(t) = ctx.tlb {
+                let bytes = match w {
+                    StoreW::B => 1,
+                    StoreW::H => 2,
+                    StoreW::W => 4,
+                    StoreW::D => 8,
+                };
+                tlb_probe(f, t, rs1, imm, t.tlb_write_off, bytes);
+                f.instruction(&Instruction::If(BlockType::Empty));
+                tlb_host_addr(f, t, t.tlb_write_off);
+                load_reg(f, rs2); // val
+                let arg = |align| MemArg { offset: 0, align, memory_index: 0 };
+                f.instruction(&match w {
+                    StoreW::B => Instruction::I64Store8(arg(0)),
+                    StoreW::H => Instruction::I64Store16(arg(1)),
+                    StoreW::W => Instruction::I64Store32(arg(2)),
+                    StoreW::D => Instruction::I64Store(arg(3)),
+                });
+                f.instruction(&Instruction::Else);
+                f.instruction(&Instruction::LocalGet(0)); // state
+                f.instruction(&Instruction::LocalGet(2)); // addr
+                load_reg(f, rs2); // val
+                f.instruction(&Instruction::Call(helper));
+                fault_check(f, fault_pc);
+                f.instruction(&Instruction::End);
+            } else {
+                f.instruction(&Instruction::LocalGet(0)); // state
+                load_reg(f, rs1);
+                f.instruction(&Instruction::I64Const(imm));
+                f.instruction(&Instruction::I64Add); // addr
+                load_reg(f, rs2); // val
+                f.instruction(&Instruction::Call(helper));
+                fault_check(f, fault_pc);
+            }
         }
     }
+}
+
+/// Emit the shared front half of an inline TLB probe: compute the effective
+/// address into local 2, the TLB entry pointer into local 3, and leave the
+/// tag-compare result (i32 bool) on the stack. `tlb_off` selects tlb_read or
+/// tlb_write. Mirrors the C fast path:
+///   idx  = (addr >> PG_SHIFT) & (TLB_SIZE - 1)
+///   hit  = tlb[idx].vaddr == (addr & ~(PG_MASK & ~(bytes - 1)))
+fn tlb_probe(f: &mut Function, t: TlbLayout, rs1: u32, imm: i64, tlb_off: u32, bytes: u64) {
+    // local 2 = addr = reg[rs1] + imm
+    load_reg(f, rs1);
+    f.instruction(&Instruction::I64Const(imm));
+    f.instruction(&Instruction::I64Add);
+    f.instruction(&Instruction::LocalTee(2));
+    // local 3 = state + ((addr >> pg_shift) & idx_mask) << entry_shift
+    f.instruction(&Instruction::I64Const(t.pg_shift as i64));
+    f.instruction(&Instruction::I64ShrU);
+    f.instruction(&Instruction::I32WrapI64);
+    f.instruction(&Instruction::I32Const(t.idx_mask as i32));
+    f.instruction(&Instruction::I32And);
+    f.instruction(&Instruction::I32Const(t.entry_shift as i32));
+    f.instruction(&Instruction::I32Shl);
+    f.instruction(&Instruction::LocalGet(0));
+    f.instruction(&Instruction::I32Add);
+    f.instruction(&Instruction::LocalTee(3));
+    // tag compare
+    f.instruction(&Instruction::I64Load(MemArg {
+        offset: (tlb_off + t.vaddr_off) as u64,
+        align: 3,
+        memory_index: 0,
+    }));
+    f.instruction(&Instruction::LocalGet(2));
+    f.instruction(&Instruction::I64Const(tag_mask(t.pg_shift, bytes)));
+    f.instruction(&Instruction::I64And);
+    f.instruction(&Instruction::I64Eq);
+}
+
+/// Emit the fast-path host address: mem[entry.addend] + wrap32(addr), using
+/// the locals tlb_probe established. Wrap-add reproduces the C macro's
+/// `mem_addend + (uintptr_t)addr` on wasm32 exactly.
+fn tlb_host_addr(f: &mut Function, t: TlbLayout, tlb_off: u32) {
+    f.instruction(&Instruction::LocalGet(3));
+    f.instruction(&Instruction::I32Load(MemArg {
+        offset: (tlb_off + t.addend_off) as u64,
+        align: 2,
+        memory_index: 0,
+    }));
+    f.instruction(&Instruction::LocalGet(2));
+    f.instruction(&Instruction::I32WrapI64);
+    f.instruction(&Instruction::I32Add);
 }
 
 /// Emit the post-helper fault check: nonzero return = MMU fault; bail out of
