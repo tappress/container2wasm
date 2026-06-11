@@ -48,7 +48,7 @@ fn ir_block_n555() -> Vec<u8> {
 
 fn build_and_instantiate() -> (Engine, Module) {
     let engine = Engine::default();
-    let (bytes, _used) = codegen::build_block(&ir_block_n555(), 0x11eb0, 0x11ebc, None);
+    let (bytes, _used) = codegen::build_block(&ir_block_n555(), 0x11eb0, 0x11ebc, 3, None, None);
     let module = Module::from_binary(&engine, &bytes).expect("module compiles");
     (engine, module)
 }

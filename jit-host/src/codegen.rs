@@ -67,6 +67,49 @@ pub struct TlbLayout {
     pub pg_shift: u32,
 }
 
+/// Chain layout constants read once from the guest's `c2w_jit_tlb_layout`
+/// export (Batch 8, selectors 7-19), used only when JIT_CHAIN=1 opts in
+/// (measured a net loss on boot-heavy workloads under wasmtime — see the
+/// main.rs comment at the query site). Present = every block gets (a) an entry
+/// prologue that decrements `s->n_cycles` by its own insn count ("self-
+/// charge" — the host must ack this to the guest via selector 20 so the C
+/// dispatch hook stops charging), and (b) an exit epilogue that probes the
+/// guest's own pc->slot map — replicating jit_map_lookup's pc + generation
+/// checks bit-for-bit — and `return_call_indirect`s straight into the next
+/// compiled block while cycle budget remains. The C dispatch loop is then
+/// only re-entered on a miss, a stale generation, an MMU-fault bail, or
+/// budget exhaustion (which is what lets timer interrupts in: `mip` can't
+/// newly assert mid-chain because CSR writes and MMIO are scan terminators /
+/// helper slow paths, so honoring `n_cycles` preserves the interpreter's
+/// interrupt latency exactly).
+///
+/// All `*_addr` / `*_base` fields are absolute wasm32 linear-memory addresses
+/// of guest globals; offsets are field offsets within their structs.
+#[derive(Clone, Copy, Debug)]
+pub struct ChainLayout {
+    pub n_cycles_off: u32,
+    pub map_base: u32,
+    pub entry_size: u32,
+    pub fn_idx_off: u32,
+    pub user_gen_off: u32,
+    pub global_gen_off: u32,
+    pub page_gen_off: u32,
+    pub map_bits: u32,
+    pub page_gen_bits: u32,
+    pub user_gen_addr: u32,
+    pub global_gen_addr: u32,
+    pub page_gen_base: u32,
+    pub chain_hops_addr: u32,
+}
+
+/// Spec constants of the guest's map design, duplicated from jit_interface.h
+/// (jit_map_hash / jit_page_hash / JIT_KERNEL_VA_BASE). The hash multiplier
+/// and page shift are baked into both the C lookup and the emitted epilogue;
+/// they can only change together.
+const HASH_MULT: i64 = 0x9E3779B97F4A7C15u64 as i64;
+const PAGE_SHIFT: i64 = 12;
+const KERNEL_VA_BASE: i64 = 0xffffffc000000000u64 as i64;
+
 /// The fast-path tag the C macros compare against:
 /// `addr & ~(PG_MASK & ~(bytes - 1))`. Page bits select the entry; the kept
 /// low bits make any access misaligned for its width fail the compare (TLB
@@ -109,6 +152,11 @@ struct Ctx {
     tlb: Option<TlbLayout>,
 }
 
+/// Locals used by the chain epilogue, appended after the existing scratch
+/// groups (1,2 i64; 3 i32; 4-6 i64).
+const CHAIN_NEXT: u32 = 7; // i64: the block's computed next_pc
+const CHAIN_EPTR: u32 = 8; // i32: candidate jit_map_entry address
+
 /// Build a wasm module containing one exported function "block" with signature
 /// `(state_ptr: i32) -> (next_pc: i64)` implementing the given IR sequence.
 ///
@@ -118,13 +166,19 @@ struct Ctx {
 /// compiled run ends.
 ///
 /// Returns the module bytes plus the helper ids the block imports, in import
-/// order — the caller must pass exactly those guest funcs (after the memory)
-/// to instantiation.
+/// order — the caller must pass exactly those guest funcs (after the memory,
+/// and after the funcref table when `chain` is set) to instantiation.
+///
+/// `n_insns` is the guest instruction count the scanner measured for this
+/// block — NOT derivable from the IR (x0-write nops emit no IR tuple) — and
+/// is baked as the self-charge constant when chaining. Ignored otherwise.
 pub fn build_block(
     ir: &[u8],
     start_pc: u64,
     block_end_pc: u64,
+    n_insns: u32,
     tlb: Option<&TlbLayout>,
+    chain: Option<&ChainLayout>,
 ) -> (Vec<u8>, Vec<usize>) {
     let ops = parse_ir(ir);
 
@@ -175,6 +229,23 @@ pub fn build_block(
             page_size_log2: None,
         }),
     );
+    // Chain mode: import the guest module's own funcref table (the one its
+    // pc->slot map indexes and the host grows at registration) so the
+    // epilogue can return_call_indirect into the next block. Table imports
+    // don't consume function-index space, so helper indices are unaffected.
+    if chain.is_some() {
+        imports.import(
+            "guest",
+            "table",
+            EntityType::Table(TableType {
+                element_type: RefType::FUNCREF,
+                table64: false,
+                minimum: 0,
+                maximum: None,
+                shared: false,
+            }),
+        );
+    }
     for &h in &used {
         let ty = if h < 7 {
             1
@@ -210,14 +281,38 @@ pub fn build_block(
     // 2 (i64) = mem-op effective address, 3 (i32) = TLB entry pointer,
     // 4-6 (i64) = MUL/DIV scratch (a, b, mulh sign-correction). 1 and 2
     // double as mulhu partial-product scratch — they're free between ops.
+    // Chain mode appends 7 (i64) = next_pc, 8 (i32) = map-entry pointer.
     let mut codes = CodeSection::new();
-    let mut f = Function::new(vec![(2, ValType::I64), (1, ValType::I32), (3, ValType::I64)]);
+    let mut locals = vec![(2, ValType::I64), (1, ValType::I32), (3, ValType::I64)];
+    if chain.is_some() {
+        locals.push((1, ValType::I64));
+        locals.push((1, ValType::I32));
+    }
+    let mut f = Function::new(locals);
+    if let Some(c) = chain {
+        // Self-charge at entry: s->n_cycles -= n_insns. Entry (not exit) so
+        // MMU-fault bails stay charged too — same conservative overcharge
+        // the C hook applied. The host's selector-20 ack told the hook to
+        // stop charging on our behalf.
+        f.instruction(&Instruction::LocalGet(0));
+        f.instruction(&Instruction::LocalGet(0));
+        f.instruction(&Instruction::I32Load(memarg32(c.n_cycles_off)));
+        f.instruction(&Instruction::I32Const(n_insns as i32));
+        f.instruction(&Instruction::I32Sub);
+        f.instruction(&Instruction::I32Store(memarg32(c.n_cycles_off)));
+    }
     let ends_with_terminator = ops.last().map(Op::is_terminator).unwrap_or(false);
     emit_ops(&mut f, &ops, &ctx);
     // Non-terminator block: fall through to the static end-PC constant.
     // Terminator block: the last op already left next_pc on the stack.
     if !ends_with_terminator {
         f.instruction(&Instruction::I64Const(block_end_pc as i64));
+    }
+    // Chain mode: instead of returning next_pc to the C dispatch loop, try
+    // to dispatch it ourselves. Fault bails (`Return` inside fault_check)
+    // intentionally skip this — the interpreter must re-take the fault.
+    if let Some(c) = chain {
+        chain_epilogue(&mut f, c);
     }
     f.instruction(&Instruction::End);
     codes.function(&f);
@@ -855,6 +950,110 @@ fn tlb_host_addr(f: &mut Function, t: TlbLayout, tlb_off: u32) {
     f.instruction(&Instruction::LocalGet(2));
     f.instruction(&Instruction::I32WrapI64);
     f.instruction(&Instruction::I32Add);
+}
+
+fn memarg32(offset: u32) -> MemArg {
+    MemArg { offset: offset as u64, align: 2, memory_index: 0 }
+}
+fn memarg64(offset: u32) -> MemArg {
+    MemArg { offset: offset as u64, align: 3, memory_index: 0 }
+}
+
+/// Chain epilogue (Batch 8). Stack on entry: [next_pc i64]. Replicates the
+/// C-side jit_map_lookup checks (pc match + global/page/user generation
+/// stamps) against the guest's live map in linear memory; on a validated hit
+/// with cycle budget remaining, tail-calls the next compiled block through
+/// the imported funcref table. Any check failing returns next_pc to the C
+/// dispatch loop — exactly what the no-chain build does unconditionally.
+///
+/// Generation counters cannot change mid-chain (satp/CSR writes and fence.i
+/// are scan terminators, executed only by the interpreter), so a stamp that
+/// matches here is as fresh as one the C hook would have seen.
+fn chain_epilogue(f: &mut Function, c: &ChainLayout) {
+    let ret_next = |f: &mut Function| {
+        f.instruction(&Instruction::If(BlockType::Empty));
+        f.instruction(&Instruction::LocalGet(CHAIN_NEXT));
+        f.instruction(&Instruction::Return);
+        f.instruction(&Instruction::End);
+    };
+    f.instruction(&Instruction::LocalSet(CHAIN_NEXT));
+    // Budget: if (s->n_cycles <= 0) return — lets the outer loop service
+    // timer interrupts. The target block self-charges at its own entry.
+    f.instruction(&Instruction::LocalGet(0));
+    f.instruction(&Instruction::I32Load(memarg32(c.n_cycles_off)));
+    f.instruction(&Instruction::I32Const(0));
+    f.instruction(&Instruction::I32LeS);
+    ret_next(f);
+    // eptr = &map[((next_pc >> 1) * MULT) >> (64 - MAP_BITS)]
+    f.instruction(&Instruction::LocalGet(CHAIN_NEXT));
+    f.instruction(&Instruction::I64Const(1));
+    f.instruction(&Instruction::I64ShrU);
+    f.instruction(&Instruction::I64Const(HASH_MULT));
+    f.instruction(&Instruction::I64Mul);
+    f.instruction(&Instruction::I64Const(64 - c.map_bits as i64));
+    f.instruction(&Instruction::I64ShrU);
+    f.instruction(&Instruction::I32WrapI64);
+    f.instruction(&Instruction::I32Const(c.entry_size as i32));
+    f.instruction(&Instruction::I32Mul);
+    f.instruction(&Instruction::I32Const(c.map_base as i32));
+    f.instruction(&Instruction::I32Add);
+    f.instruction(&Instruction::LocalTee(CHAIN_EPTR));
+    // e->pc != next_pc -> miss
+    f.instruction(&Instruction::I64Load(memarg64(0)));
+    f.instruction(&Instruction::LocalGet(CHAIN_NEXT));
+    f.instruction(&Instruction::I64Ne);
+    ret_next(f);
+    // e->global_gen != c2w_jit_global_gen -> stale
+    f.instruction(&Instruction::LocalGet(CHAIN_EPTR));
+    f.instruction(&Instruction::I32Load(memarg32(c.global_gen_off)));
+    f.instruction(&Instruction::I32Const(0));
+    f.instruction(&Instruction::I32Load(memarg32(c.global_gen_addr)));
+    f.instruction(&Instruction::I32Ne);
+    ret_next(f);
+    // e->page_gen != c2w_jit_page_gen[((next_pc >> 12) * MULT) >> (64 - PG_BITS)]
+    f.instruction(&Instruction::LocalGet(CHAIN_EPTR));
+    f.instruction(&Instruction::I32Load(memarg32(c.page_gen_off)));
+    f.instruction(&Instruction::LocalGet(CHAIN_NEXT));
+    f.instruction(&Instruction::I64Const(PAGE_SHIFT));
+    f.instruction(&Instruction::I64ShrU);
+    f.instruction(&Instruction::I64Const(HASH_MULT));
+    f.instruction(&Instruction::I64Mul);
+    f.instruction(&Instruction::I64Const(64 - c.page_gen_bits as i64));
+    f.instruction(&Instruction::I64ShrU);
+    f.instruction(&Instruction::I32WrapI64);
+    f.instruction(&Instruction::I32Const(2));
+    f.instruction(&Instruction::I32Shl);
+    f.instruction(&Instruction::I32Const(c.page_gen_base as i32));
+    f.instruction(&Instruction::I32Add);
+    f.instruction(&Instruction::I32Load(memarg32(0)));
+    f.instruction(&Instruction::I32Ne);
+    ret_next(f);
+    // User-half pcs additionally check user_gen (kernel half is globally
+    // mapped and survives satp rolls — same rule as jit_map_lookup).
+    f.instruction(&Instruction::LocalGet(CHAIN_NEXT));
+    f.instruction(&Instruction::I64Const(KERNEL_VA_BASE));
+    f.instruction(&Instruction::I64LtU);
+    f.instruction(&Instruction::If(BlockType::Empty));
+    f.instruction(&Instruction::LocalGet(CHAIN_EPTR));
+    f.instruction(&Instruction::I32Load(memarg32(c.user_gen_off)));
+    f.instruction(&Instruction::I32Const(0));
+    f.instruction(&Instruction::I32Load(memarg32(c.user_gen_addr)));
+    f.instruction(&Instruction::I32Ne);
+    ret_next(f);
+    f.instruction(&Instruction::End);
+    // c2w_jit_chain_hops++ (u64 stat the host reads at exit)
+    f.instruction(&Instruction::I32Const(0));
+    f.instruction(&Instruction::I32Const(0));
+    f.instruction(&Instruction::I64Load(memarg64(c.chain_hops_addr)));
+    f.instruction(&Instruction::I64Const(1));
+    f.instruction(&Instruction::I64Add);
+    f.instruction(&Instruction::I64Store(memarg64(c.chain_hops_addr)));
+    // Tail-call the next block: (state_ptr) through table[e->fn_idx]. Frame
+    // is replaced, so arbitrarily long chains can't grow the wasm stack.
+    f.instruction(&Instruction::LocalGet(0));
+    f.instruction(&Instruction::LocalGet(CHAIN_EPTR));
+    f.instruction(&Instruction::I32Load(memarg32(c.fn_idx_off)));
+    f.instruction(&Instruction::ReturnCallIndirect { type_index: 0, table_index: 0 });
 }
 
 /// Emit the post-helper fault check: nonzero return = MMU fault; bail out of

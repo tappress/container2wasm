@@ -538,3 +538,25 @@ All outputs correct, reg_fail=0. Block-entry hit rate on hello 64.9% → 67.2%; 
 1. **Block chaining / longer regions** — at ~4-6 insns/block and ~2B entries per loop run, entry overhead is the loop's whole remaining story.
 2. **Async/background compile** — echo's gap to jit0 is still mostly cranelift-on-critical-path (~2.2-2.4s compile_ms on hello-class boots).
 3. **Browser-worker port checkpoint** (overdue since Batch 3) before more wasmtime-specific tuning — both remaining levers shape differently there (JS host boundary, Liftoff tiering).
+
+#### Batch 8 result (2026-06-11): block chaining lands correct — wins only the hot loop (−3%), loses hello/echo to compile + miss-path overhead; shelved to opt-in (`JIT_CHAIN=1`)
+
+**What was built** (tinyemu-c2w `d607607`, container2wasm this commit): compiled blocks tail-call each other instead of returning to the C dispatch loop on every transition. The exit epilogue (~60 wasm ops, once per block) probes the guest's own pc→slot map in linear memory — replicating `jit_map_lookup`'s pc + global/page/user gen checks bit-for-bit — and on a validated hit `return_call_indirect`s through the imported funcref table (frame replaced, so chains can't grow the wasm stack). Misses/stale gens/fault bails return to the C loop as before. Correctness pillars:
+- **Cycle accounting moves into the blocks**: each block decrements `s->n_cycles` by its own insn count at entry ("self-charge") because chained blocks never return to the hook. `GET_INSN_COUNTER() = insn_counter_addend - s->n_cycles`, so guest virtual time stays exact mid-chain. The scanner's true insn count (NOT derivable from IR — x0-write nops emit no tuple) rides a new 5-param `register_block2` import (old 4-param name kept registered for pre-Batch-8 artifacts) and is folded into the re-link hash + content-cache key (two byte sequences can yield identical IR with different counts via 2/4-byte nop mixes).
+- **ABI handshake**: layout selectors 7-19 expose map base / entry layout / gen-counter + n_cycles addresses; selector 20 is an ack with a side effect — host calls it iff it emits self-charging blocks, setting `c2w_jit_selfcharge` so the hook stops charging. Old host + new guest, new host + old guest, and `JIT_CHAIN` unset all degrade cleanly to Batch 4.5 behavior.
+- **Interrupt latency preserved**: epilogue re-checks `n_cycles <= 0` before every hop and bails to the loop on exhaustion. `mip` can't newly assert mid-chain from guest action (CSR writes/fence are scan terminators) except via MMIO stores through helpers (e.g. CLINT msip) — those get serviced at budget exhaustion, an architecturally legal asynchronous-interrupt delay.
+- 6 semantic tests ([jit-host/tests/chain.rs](jit-host/tests/chain.rs)): hop executes target + exact two-block self-charge, budget exhaustion returns without hop, stale user/global/page gens each fall back, kernel-half pcs skip the user-gen check, fault path never probes the map, no-chain mode emits the legacy shape.
+
+**Numbers (3-run interleaved medians, same session; nochain = same jit7c artifact with chaining off)**:
+
+| Workload | jit0 | jit6 (B4.5) | jit7c chain | jit7c nochain |
+|---|---|---|---|---|
+| busybox echo hi | 2.41s | 3.99s | 4.36s | 4.08s |
+| node hello | 12.64s | 13.70s | **15.14s** | 13.66s |
+| 1e8 arith loop | 78.39s | 87.01s | **86.45s** | 89.37s |
+
+All outputs correct, reg_fail=0. Chain beats nochain on the loop in 3/3 rounds (−2.9s median at 1.0B hops) and loses hello in 3/3 (+1.5s at 74.7M hops). Decomposition: the avoided C-loop round trip is worth ~3.6ns/hop, but chain mode costs +15-20% cranelift time (epilogue ops; hello compile_ms 2.86→3.42s) plus probe-work on every block exit that misses — on boot-heavy workloads the misses + compile outweigh the hops. **Batch 5's lesson generalizes: under wasmtime/cranelift, per-transition micro-savings (a few ns) lose to any per-block code-size/compile cost.** Dispatch round trips and cross-module calls are simply not expensive enough here to pay for inlining anything.
+
+**Verdict**: opt-in via `JIT_CHAIN=1` (like `JIT_INLINE_TLB`), fully tested and kept working. Re-evaluate (a) once async compile takes cranelift off the critical path — chaining's loop win would then stand alone, and (b) at browser-port time, where compile (Liftoff) is cheaper and call costs differ. The "longer regions" idea survives in a different form: superblock/trace compilation (fewer, longer blocks) attacks entry overhead without per-exit probe work — but it's Tier 3 phase 2 territory.
+
+**Consequence for the plan**: with coverage (B4.5) and transition cost (B8) both measured to their ceilings, **async/background compile is now unambiguously the top lever** — hello's entire 1.0s gap to jit0 and most of echo's 1.6s gap is cranelift-on-critical-path. After that, the browser-worker port checkpoint (now 5 batches overdue) before any further wasmtime-side tuning.

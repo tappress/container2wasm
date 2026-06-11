@@ -45,7 +45,7 @@ struct HostState {
     /// fault pcs derived from it. Also keeps the store's instance count
     /// bounded by unique block content (wasmtime caps instances per store at
     /// ~10k by default).
-    module_cache: HashMap<(u64, u64, Vec<u8>), CachedBlock>,
+    module_cache: HashMap<(u64, u64, u32, Vec<u8>), CachedBlock>,
     /// Cached handle to the guest module's exported linear memory.
     guest_memory: Option<Memory>,
     /// Memory helpers exported by the guest (c2w_jit_lb..sd, indexed by
@@ -62,6 +62,11 @@ struct HostState {
     /// net loss under wasmtime — see codegen::TlbLayout). None = helper-call
     /// mem codegen, the default.
     tlb_layout: Option<codegen::TlbLayout>,
+    /// Chain layout (Batch 8): present when the guest exports the pc->slot
+    /// map / generation-counter addresses (layout selectors 7-19) and
+    /// JIT_NO_CHAIN is unset. Blocks then self-charge n_cycles and tail-call
+    /// each other through the guest's funcref table. See codegen::ChainLayout.
+    chain_layout: Option<codegen::ChainLayout>,
     /// Raises wasmtime's default 10k-instances-per-store cap — every unique
     /// compiled block is an instance, and V8's self-modifying code mints new
     /// unique content continuously, so Node workloads blow past 10k.
@@ -201,44 +206,76 @@ fn main() -> Result<()> {
                 .collect()
         })
         .unwrap_or_default();
+    // Shared body for both registration imports. "register_block" is the
+    // pre-Batch-8 4-param ABI (kept so older artifacts still link; they never
+    // chain, so the missing insn count is irrelevant); "register_block2"
+    // adds n_insns, which chain-mode codegen bakes as the block's
+    // self-charge constant.
+    let register_entry = move |caller: &mut Caller<'_, HostState>,
+                               pc: i64,
+                               end_pc: i64,
+                               ir_ptr: i32,
+                               ir_len: i32,
+                               n_insns: u32,
+                               skip_pcs: &std::collections::HashSet<u64>|
+          -> i32 {
+        // Failure sentinel differs by dispatch mode: wasm-side dispatch
+        // (guest table exported) treats any value <= 0 as failure, legacy
+        // host dispatch checks != 0.
+        let fail = if caller.data().guest_table.is_some() { -1 } else { 0 };
+        if disable_compile
+            || caller.data().n_register_ok >= max_blocks
+            || skip_pcs.contains(&(pc as u64))
+        {
+            caller.data_mut().blocks.insert(pc as u64, None);
+            return fail;
+        }
+        let t0 = std::time::Instant::now();
+        let r = match register_block_inner(caller, pc as u64, end_pc as u64, ir_ptr, ir_len, n_insns)
+        {
+            Ok(ret) => {
+                caller.data_mut().n_register_ok += 1;
+                ret
+            }
+            Err(e) => {
+                if std::env::var_os("JIT_LOG_FAIL").is_some() {
+                    eprintln!("[jit-host] register_block failed @ pc=0x{:x}: {e}", pc);
+                }
+                let st = caller.data_mut();
+                st.blocks.insert(pc as u64, None);
+                st.n_register_fail += 1;
+                fail
+            }
+        };
+        caller.data_mut().compile_nanos += t0.elapsed().as_nanos() as u64;
+        r
+    };
+    {
+        let skip_pcs = skip_pcs.clone();
+        linker.func_wrap(
+            "jit",
+            "register_block",
+            move |mut caller: Caller<'_, HostState>,
+                  pc: i64,
+                  end_pc: i64,
+                  ir_ptr: i32,
+                  ir_len: i32|
+                  -> i32 {
+                register_entry(&mut caller, pc, end_pc, ir_ptr, ir_len, 0, &skip_pcs)
+            },
+        )?;
+    }
     linker.func_wrap(
         "jit",
-        "register_block",
+        "register_block2",
         move |mut caller: Caller<'_, HostState>,
               pc: i64,
               end_pc: i64,
               ir_ptr: i32,
-              ir_len: i32|
+              ir_len: i32,
+              n_insns: i32|
               -> i32 {
-            // Failure sentinel differs by dispatch mode: wasm-side dispatch
-            // (guest table exported) treats any value <= 0 as failure, legacy
-            // host dispatch checks != 0.
-            let fail = if caller.data().guest_table.is_some() { -1 } else { 0 };
-            if disable_compile
-                || caller.data().n_register_ok >= max_blocks
-                || skip_pcs.contains(&(pc as u64))
-            {
-                caller.data_mut().blocks.insert(pc as u64, None);
-                return fail;
-            }
-            let t0 = std::time::Instant::now();
-            let r = match register_block_inner(&mut caller, pc as u64, end_pc as u64, ir_ptr, ir_len) {
-                Ok(ret) => {
-                    caller.data_mut().n_register_ok += 1;
-                    ret
-                }
-                Err(e) => {
-                    if std::env::var_os("JIT_LOG_FAIL").is_some() {
-                        eprintln!("[jit-host] register_block failed @ pc=0x{:x}: {e}", pc);
-                    }
-                    let st = caller.data_mut();
-                    st.blocks.insert(pc as u64, None);
-                    st.n_register_fail += 1;
-                    fail
-                }
-            };
-            caller.data_mut().compile_nanos += t0.elapsed().as_nanos() as u64;
-            r
+            register_entry(&mut caller, pc, end_pc, ir_ptr, ir_len, n_insns as u32, &skip_pcs)
         },
     )?;
     linker.func_wrap(
@@ -308,6 +345,7 @@ fn main() -> Result<()> {
         mem_helpers: None,
         guest_table: None,
         tlb_layout: None,
+        chain_layout: None,
         n_register_ok: 0,
         n_register_fail: 0,
         n_cache_hit: 0,
@@ -397,6 +435,58 @@ fn main() -> Result<()> {
         );
         store.data_mut().tlb_layout = Some(layout);
     }
+    // Chain layout (Batch 8): selectors 7-19 of the same export. Pre-Batch-8
+    // guests return 0xffffffff for them. Only meaningful with wasm-side
+    // dispatch (the epilogue probes the guest's own map/table).
+    //
+    // OPT-IN ONLY (JIT_CHAIN=1): same-artifact A/B measured chaining as a
+    // net loss on boot-heavy workloads — echo 4.36s vs 4.08s, node hello
+    // 15.14s vs 13.66s — and a ~3% win only on the 1e8 hot loop (86.4s vs
+    // 89.4s at 1.0B hops ≈ 3.6ns saved per avoided dispatch round trip).
+    // The epilogue's probe work on chain misses, the entry self-charge, and
+    // ~20% more cranelift time outweigh the per-hop saving — the Batch 5
+    // inline-TLB lesson again. Re-evaluate once compile cost is off the
+    // critical path (async compile) and at browser-port time.
+    if std::env::var_os("JIT_CHAIN").is_some() && store.data().guest_table.is_some() {
+        if let Ok(q) = instance.get_typed_func::<i32, i32>(&mut store, "c2w_jit_tlb_layout") {
+            let mut vals = [0u32; 13];
+            let mut all_present = true;
+            for (i, v) in vals.iter_mut().enumerate() {
+                *v = q.call(&mut store, 7 + i as i32)? as u32;
+                if *v == 0xffffffff {
+                    all_present = false;
+                    break;
+                }
+            }
+            if all_present {
+                let layout = codegen::ChainLayout {
+                    n_cycles_off: vals[0],
+                    map_base: vals[1],
+                    entry_size: vals[2],
+                    fn_idx_off: vals[3],
+                    user_gen_off: vals[4],
+                    global_gen_off: vals[5],
+                    page_gen_off: vals[6],
+                    map_bits: vals[7],
+                    page_gen_bits: vals[8],
+                    user_gen_addr: vals[9],
+                    global_gen_addr: vals[10],
+                    page_gen_base: vals[11],
+                    chain_hops_addr: vals[12],
+                };
+                // Ack selector: tells the guest that blocks self-charge
+                // n_cycles from now on, so the dispatch hook must not.
+                if q.call(&mut store, 20)? != 1 {
+                    return Err(Error::msg("chain layout present but selfcharge ack failed"));
+                }
+                eprintln!(
+                    "[jit-host] guest exports chain layout (map@0x{:x} esz={} bits={}/{}): block chaining enabled",
+                    layout.map_base, layout.entry_size, layout.map_bits, layout.page_gen_bits
+                );
+                store.data_mut().chain_layout = Some(layout);
+            }
+        }
+    }
     let start = instance.get_typed_func::<(), ()>(&mut store, "_start")?;
     let run_result = start.call(&mut store, ());
     dump_stats(&store);
@@ -414,8 +504,20 @@ fn main() -> Result<()> {
 fn dump_stats(store: &Store<HostState>) {
     let st = store.data();
     let table_size = st.guest_table.map_or(0, |t| t.size(store));
+    // Chained tail-call transitions: bumped by emitted block code in guest
+    // linear memory; the host only reads it here.
+    let chain_hops = match (st.guest_memory, st.chain_layout) {
+        (Some(mem), Some(c)) => {
+            let a = c.chain_hops_addr as usize;
+            mem.data(store)
+                .get(a..a + 8)
+                .map(|b| u64::from_le_bytes(b.try_into().unwrap()))
+                .unwrap_or(0)
+        }
+        _ => 0,
+    };
     eprintln!(
-        "[jit-host] stats: blocks={} cache={} table={} reg_ok={} cache_hit={} reg_fail={} dispatch_hit={} dispatch_miss={} flush_satp={} flush_sfence={} flush_fencei={} compile_ms={:.1}",
+        "[jit-host] stats: chain_hops={chain_hops} blocks={} cache={} table={} reg_ok={} cache_hit={} reg_fail={} dispatch_hit={} dispatch_miss={} flush_satp={} flush_sfence={} flush_fencei={} compile_ms={:.1}",
         st.blocks.len(),
         st.module_cache.len(),
         table_size,
@@ -446,6 +548,7 @@ fn register_block_inner(
     end_pc: u64,
     ir_ptr: i32,
     ir_len: i32,
+    n_insns: u32,
 ) -> Result<i32> {
     let mem = caller
         .data()
@@ -513,10 +616,12 @@ fn register_block_inner(
     } else {
         ir_bytes
     };
-    // Content-cache hit: same IR bytes + same start/end pc produce
+    // Content-cache hit: same IR bytes + same start/end pc + same insn count
+    // (baked as the chain-mode self-charge; two byte sequences can produce
+    // identical IR with different counts via x0-nop encoding mixes) produce
     // byte-identical wasm, so reuse the existing instance instead of
     // recompiling.
-    let cache_key = (pc, end_pc, ir_bytes.clone());
+    let cache_key = (pc, end_pc, n_insns, ir_bytes.clone());
     if let Some(cb) = caller.data().module_cache.get(&cache_key) {
         let cb = cb.clone();
         let st = caller.data_mut();
@@ -532,7 +637,9 @@ fn register_block_inner(
         });
     }
     let tlb = caller.data().tlb_layout;
-    let (bytes, used_helpers) = codegen::build_block(&ir_bytes, pc, end_pc, tlb.as_ref());
+    let chain = caller.data().chain_layout;
+    let (bytes, used_helpers) =
+        codegen::build_block(&ir_bytes, pc, end_pc, n_insns, tlb.as_ref(), chain.as_ref());
     // JIT_DUMP_PCS=11eb0,ffffffff8002561a,... — dump IR+wasm for specific PCs
     // (hex, no 0x prefix needed) at registration time.
     if let Ok(pcs_str) = std::env::var("JIT_DUMP_PCS") {
@@ -572,6 +679,15 @@ fn register_block_inner(
     // uses, in the order build_block declared them.
     let externs: Vec<Extern> = {
         let mut v = vec![Extern::Memory(mem)];
+        if chain.is_some() {
+            // Chain-mode blocks import the guest's funcref table (declared
+            // right after the memory) for return_call_indirect.
+            let table = caller
+                .data()
+                .guest_table
+                .ok_or_else(|| Error::msg("chain mode without guest table"))?;
+            v.push(Extern::Table(table));
+        }
         if !used_helpers.is_empty() {
             let helpers = caller.data().mem_helpers.as_ref().ok_or_else(|| {
                 Error::msg("block uses memory ops but guest exports no c2w_jit_* helpers")

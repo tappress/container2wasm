@@ -111,7 +111,7 @@ fn run_muldiv(kind: u8, a: u64, b: u64) -> u64 {
         reg_off(12) as u16,
         0,
     );
-    let (bytes, used) = codegen::build_block(&ir, 0x1000, 0x1004, None);
+    let (bytes, used) = codegen::build_block(&ir, 0x1000, 0x1004, 1, None, None);
     assert!(used.is_empty(), "muldiv blocks import no helpers");
     let engine = Engine::default();
     let module = Module::from_binary(&engine, &bytes).expect("module compiles");
@@ -168,7 +168,7 @@ fn muldiv_mid_block_threading() {
     push(&mut ir, 52, reg_off(10) as u16, reg_off(11) as u16, reg_off(12) as u16, 0);
     push(&mut ir, 2, reg_off(13) as u16, reg_off(10) as u16, 0, 1); // addi x13, x10, 1
     push(&mut ir, 55, reg_off(14) as u16, reg_off(11) as u16, reg_off(12) as u16, 0);
-    let (bytes, used) = codegen::build_block(&ir, 0x2000, 0x200c, None);
+    let (bytes, used) = codegen::build_block(&ir, 0x2000, 0x200c, 3, None, None);
     assert!(used.is_empty());
     let engine = Engine::default();
     let module = Module::from_binary(&engine, &bytes).unwrap();
@@ -197,7 +197,7 @@ struct AmoCalls {
 
 /// Run a block whose AMO helpers are host-recorded. Returns (next_pc, calls).
 fn run_amo(ir: &[u8], regs: &[(usize, u64)], fail: bool, expect_used: &[usize]) -> (i64, AmoCalls) {
-    let (bytes, used) = codegen::build_block(ir, 0x3000, 0x3000 + 4 * 4, None);
+    let (bytes, used) = codegen::build_block(ir, 0x3000, 0x3000 + 4 * 4, 4, None, None);
     assert_eq!(used, expect_used, "helper import set");
     let engine = Engine::default();
     let module = Module::from_binary(&engine, &bytes).expect("module compiles");
