@@ -119,7 +119,7 @@ impl Harness {
     /// Build + instantiate a chain-mode block; returns its callable func.
     fn block(&mut self, ir: &[u8], start_pc: u64, end_pc: u64, n_insns: u32) -> TypedFunc<i32, i64> {
         let (bytes, used) =
-            codegen::build_block(ir, start_pc, end_pc, n_insns, None, Some(&CHAIN));
+            codegen::build_block(ir, start_pc, end_pc, n_insns, None, Some(&CHAIN), false);
         let module = Module::from_binary(&self.engine, &bytes).expect("module compiles");
         let mut externs = vec![Extern::Memory(self.mem), Extern::Table(self.table)];
         let fail_ld = Func::wrap(
@@ -253,7 +253,7 @@ fn fault_bails_without_chain() {
 #[test]
 fn no_chain_mode_is_legacy_shape() {
     let engine = Engine::default();
-    let (bytes, _) = codegen::build_block(&ir_addi(5, 1), 0x1000, 0x1008, 2, None, None);
+    let (bytes, _) = codegen::build_block(&ir_addi(5, 1), 0x1000, 0x1008, 2, None, None, false);
     let module = Module::from_binary(&engine, &bytes).unwrap();
     let n_tables = module.imports().filter(|i| matches!(i.ty(), ExternType::Table(_))).count();
     assert_eq!(n_tables, 0, "legacy blocks must not import a table");

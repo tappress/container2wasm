@@ -79,7 +79,7 @@ fn run_with(
     setup: impl FnOnce(&Memory, &mut Store<Calls>),
 ) -> ((i64, Calls), Vec<u8>) {
     let engine = Engine::default();
-    let (bytes, used) = codegen::build_block(&ir_ld_sd(), start_pc, end_pc, 2, tlb, None);
+    let (bytes, used) = codegen::build_block(&ir_ld_sd(), start_pc, end_pc, 2, tlb, None, false);
     assert_eq!(used, vec![3, 10], "block should import exactly ld and sd");
     let module = Module::from_binary(&engine, &bytes).expect("module compiles");
     let mut store: Store<Calls> = Store::new(

@@ -1,13 +1,18 @@
 #!/usr/bin/env python3
 """Benchmark result collector: the c2w browser page POSTs one JSON result
 per run to http://localhost:8081/result?tag=...; appended as JSON lines to
-/tmp/c2w-results/results.jsonl with arrival timestamp."""
+$C2W_RESULTS_DIR/results.jsonl (default ./browser-bench/serve/results — a
+persistent, non-/tmp location so a reboot mid-suite doesn't drop results)
+with arrival timestamp."""
 import http.server
 import json
 import os
 import time
 
-OUTDIR = "/tmp/c2w-results"
+OUTDIR = os.environ.get(
+    "C2W_RESULTS_DIR",
+    os.path.join(os.path.dirname(os.path.abspath(__file__)), "serve", "results"),
+)
 OUTFILE = os.path.join(OUTDIR, "results.jsonl")
 os.makedirs(OUTDIR, exist_ok=True)
 

@@ -24,6 +24,7 @@ static mut OUT_MODULE: Vec<u8> = Vec::new();
 static mut OUT_HELPERS: Vec<u8> = Vec::new();
 static mut TLB: Option<TlbLayout> = None;
 static mut CHAIN: Option<ChainLayout> = None;
+static mut LIFT: bool = false;
 
 #[allow(static_mut_refs)]
 #[no_mangle]
@@ -41,7 +42,7 @@ pub extern "C" fn jcg_build(ir_len: u32, start_pc: u64, end_pc: u64, n_insns: u3
     unsafe {
         let ir = &IN_BUF[..ir_len as usize];
         let (bytes, helpers) =
-            build_block(ir, start_pc, end_pc, n_insns, TLB.as_ref(), CHAIN.as_ref());
+            build_block(ir, start_pc, end_pc, n_insns, TLB.as_ref(), CHAIN.as_ref(), LIFT);
         OUT_MODULE = bytes;
         OUT_HELPERS = helpers.iter().map(|&h| h as u8).collect();
         OUT_MODULE.len() as u32
@@ -86,6 +87,13 @@ pub extern "C" fn jcg_set_tlb(
             addend_off,
             pg_shift,
         });
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn jcg_set_lift(on: u32) {
+    unsafe {
+        LIFT = on != 0;
     }
 }
 

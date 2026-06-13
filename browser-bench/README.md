@@ -14,33 +14,50 @@ container command. See CLAUDE.md "Browser-port checkpoint" for results.
   the guest's memory/table/helpers, `table.grow`+`set`, returns the slot.
   Content cache keyed on (pc, end_pc, n_insns, IR bytes). flush/mark are
   stats-only (invalidation is generation-checked guest-side). URL params:
-  `cmd`/`cmd64`, `jit=off`, `chain=on`, `tlb=on`.
+  `cmd`/`cmd64`, `jit=off`, `chain=on`, `tlb=on`, `lift=on` (Batch 6
+  register lifting — pure codegen, A/Bs on the same artifact via
+  `jcg_set_lift`).
 - `htdocs/index.html` — scaffold page plus bench plumbing: relays the
   worker's result JSON (`window.__c2wResult`, console `C2W_RESULT_PAGE`),
   auto-POSTs to the collector when `post=` is set, chains through
   `suite.json` when `step=` is set, watchdog for hung runs, copy button.
 - `collector.py` — host-side result sink on :8081 (CORS), appends JSON
-  lines to /tmp/c2w-results/results.jsonl.
+  lines to `$C2W_RESULTS_DIR/results.jsonl` (default `serve/results/`, a
+  persistent non-/tmp path).
 - `gen-suite.py` — emits suite.json (one query string per step).
+- `rebuild-serve.sh` — assembles the persistent serve dir (below).
 
-## Setup
+## Serve dir (persistent, not /tmp)
 
-The remaining htdocs files come from `examples/wasi-browser` (plus the
-webpack-built browser_wasi_shim bundle from its Dockerfile) and the
-`jit-codegen-wasm` crate build:
+The runtime htdocs live in `browser-bench/serve/` (gitignored — it holds
+~185 MB of copied wasm artifacts). The old `/tmp/out-browser` scaffold was
+wiped on every reboot; `serve/` survives. `browser_wasi_shim` is plain
+`importScripts`'d source, so no webpack/Docker build is needed — assembly is
+just copies. Rebuild it any time (after a reboot, a codegen change, or to
+swap the artifact under test):
 
 ```bash
-cd examples/wasi-browser && docker build --output=$HTDOCS .
-cp examples/wasi-browser/htdocs/{worker-util,wasi-util,stack,ws-delegate,stack-worker}.js $HTDOCS/
-cp browser-bench/htdocs/* $HTDOCS/
-cargo build --release --target wasm32-unknown-unknown \
-  --manifest-path jit-codegen-wasm/Cargo.toml
-cp jit-codegen-wasm/target/wasm32-unknown-unknown/release/jit_codegen_wasm.wasm \
-  $HTDOCS/jit_codegen.wasm
-cp out/alpine-node-jit7c.wasm $HTDOCS/out.wasm     # variant-4 artifact
-cp out/alpine-node-jit0.wasm $HTDOCS/jit0.wasm     # true-interp baseline
-# serve $HTDOCS with COOP/COEP (examples/wasi-browser/xterm-pty.conf), then:
-python3 browser-bench/collector.py &
-python3 browser-bench/gen-suite.py > $HTDOCS/suite.json
-chrome-headless-shell --no-sandbox "http://localhost:8080/?<first step qs>"
+browser-bench/rebuild-serve.sh                       # default out/alpine-node-jit7c.wasm
+browser-bench/rebuild-serve.sh out/alpine-node-jitX.wasm
+```
+
+## Run
+
+```bash
+SERVE=$(pwd)/browser-bench/serve
+# serve with COOP/COEP (SharedArrayBuffer) — httpd container:
+docker run -d --rm --name c2w-bench -p 8080:80 \
+  -v $SERVE/htdocs:/usr/local/apache2/htdocs:ro \
+  -v $SERVE/xterm-pty.conf:/usr/local/apache2/conf/extra/xterm-pty.conf:ro \
+  httpd:2.4 /bin/sh -c \
+  'echo "Include conf/extra/xterm-pty.conf" >> /usr/local/apache2/conf/httpd.conf && httpd-foreground'
+
+python3 browser-bench/collector.py &                 # result sink on :8081
+python3 browser-bench/gen-suite.py > $SERVE/htdocs/suite.json
+# full Chrome hangs under WSL2; chrome-headless-shell is real V8 and works:
+CHS=~/.cache/ms-playwright/chromium_headless_shell-*/chrome-headless-shell-linux64/chrome-headless-shell
+$CHS --no-sandbox --disable-gpu --disable-dev-shm-usage \
+  --user-data-dir=/tmp/chs-profile \
+  "http://localhost:8080/?<first step qs from gen-suite stderr>"
+# the page self-chains through every suite.json step, POSTing each result.
 ```

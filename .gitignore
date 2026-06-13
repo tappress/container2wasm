@@ -4,3 +4,5 @@ out.wasm
 # Rust JIT host embedder build artifacts
 /jit-host/target/
 /jit-codegen-wasm/target/
+# Browser bench runtime serve dir (assembled artifacts; rebuilt from sources)
+/browser-bench/serve/

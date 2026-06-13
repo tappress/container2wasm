@@ -67,6 +67,11 @@ struct HostState {
     /// JIT_NO_CHAIN is unset. Blocks then self-charge n_cycles and tail-call
     /// each other through the guest's funcref table. See codegen::ChainLayout.
     chain_layout: Option<codegen::ChainLayout>,
+    /// Register lifting (Batch 6): when set (JIT_LIFT=1), block codegen keeps
+    /// each non-helper-written guest register in a wasm local for the block's
+    /// lifetime, spilling back to memory at every exit. Pure codegen — no guest
+    /// cooperation — so it A/Bs on the same artifact. Off by default.
+    lift: bool,
     /// Raises wasmtime's default 10k-instances-per-store cap — every unique
     /// compiled block is an instance, and V8's self-modifying code mints new
     /// unique content continuously, so Node workloads blow past 10k.
@@ -346,6 +351,7 @@ fn main() -> Result<()> {
         guest_table: None,
         tlb_layout: None,
         chain_layout: None,
+        lift: std::env::var_os("JIT_LIFT").is_some(),
         n_register_ok: 0,
         n_register_fail: 0,
         n_cache_hit: 0,
@@ -638,8 +644,9 @@ fn register_block_inner(
     }
     let tlb = caller.data().tlb_layout;
     let chain = caller.data().chain_layout;
+    let lift = caller.data().lift;
     let (bytes, used_helpers) =
-        codegen::build_block(&ir_bytes, pc, end_pc, n_insns, tlb.as_ref(), chain.as_ref());
+        codegen::build_block(&ir_bytes, pc, end_pc, n_insns, tlb.as_ref(), chain.as_ref(), lift);
     // JIT_DUMP_PCS=11eb0,ffffffff8002561a,... — dump IR+wasm for specific PCs
     // (hex, no 0x prefix needed) at registration time.
     if let Ok(pcs_str) = std::env::var("JIT_DUMP_PCS") {

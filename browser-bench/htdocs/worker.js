@@ -63,6 +63,7 @@ function makeJitState() {
         enabled: getParam('jit') !== 'off',
         chain: getParam('chain') === 'on',
         tlb: getParam('tlb') === 'on',
+        lift: getParam('lift') === 'on',
         jcg: null,        // codegen wasm exports
         guest: null,      // guest instance exports, set after instantiate
         cache: new Map(), // content cache: key -> table slot
@@ -140,6 +141,10 @@ function makeJitImports(js) {
 // reads, safe pre-_start) and hand the layouts to the codegen module — same
 // selector protocol as jit-host/src/main.rs.
 function configureLayouts(js) {
+    if (js.lift && js.jcg.jcg_set_lift) {
+        js.jcg.jcg_set_lift(1);
+        console.log('C2W_JIT register lifting enabled');
+    }
     var q = js.guest.c2w_jit_tlb_layout;
     if (!q) return;
     if (js.tlb) {

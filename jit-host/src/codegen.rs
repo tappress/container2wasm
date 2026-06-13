@@ -143,6 +143,184 @@ fn helper_id(op: &Op) -> Option<usize> {
     }
 }
 
+/// Register-lifting plan for one block (Batch 6). Guest registers live at fixed
+/// byte offsets in the guest's linear memory (offset = offsetof(reg[0]) +
+/// n*8); the naive codegen re-loads and re-stores them around every op. Lifting
+/// keeps a register in a wasm local for the block's lifetime so within-block
+/// reads/writes hit the local.
+///
+/// Offset 0 is special: it is the x0-discard sentinel the scanner emits for
+/// loads/AMO whose dest is x0 (real registers start at offsetof(reg[0]) != 0),
+/// and `op_lift_write`/`op_helper_write` already guard `rd != 0`, so it never
+/// enters a lift set. x0 as a *source* reads as 0 from memory and is never
+/// written, so whether it is lifted (base != 0) or skipped (base == 0), the
+/// result is correct and carries no spill.
+///
+/// Three correctness invariants, all enforced by `analyze_lift`:
+///   1. A register written by a memory/AMO **helper** (load.rd, amo.rd) is
+///      never lifted — the C helper writes guest memory directly, so a lifted
+///      local would diverge across the call. Those stay fully memory-backed.
+///   2. Every lifted register is spilled back to memory at EVERY block exit:
+///      the normal end, the chain hand-off, and the mid-block MMU-fault bail
+///      (the interpreter re-executes the faulting insn and must observe the
+///      register values that earlier ops in this block wrote).
+///   3. Any register that might be spilled at a fault bail is loaded at entry,
+///      so its local holds the live memory value even when its own write comes
+///      after the fault point (spilling it back is then a no-op rather than a
+///      clobber). Fault-free blocks skip that safety load — only read-before-
+///      write registers are loaded at entry there, keeping hot ALU loops tight.
+struct Lift {
+    /// (reg byte offset, wasm local index, written → must spill at exit).
+    regs: Vec<(u32, u32, bool)>,
+    /// (offset, local) pairs to initialize from guest memory at block entry.
+    entry: Vec<(u32, u32)>,
+}
+
+impl Lift {
+    fn empty() -> Self {
+        Lift { regs: Vec::new(), entry: Vec::new() }
+    }
+    fn local_of(&self, off: u32) -> Option<u32> {
+        self.regs.iter().find(|(o, _, _)| *o == off).map(|&(_, l, _)| l)
+    }
+}
+
+/// Source register offsets an op reads (real registers only — never the pc_off
+/// that loads/stores pack into a spare reg field). x0 (offset 0) may appear and
+/// is filtered by the caller.
+fn op_reads(op: &Op) -> ([u32; 2], usize) {
+    use Op::*;
+    match *op {
+        Const { .. } | Jal { .. } => ([0, 0], 0),
+        Addi { rs1, .. } | Addiw { rs1, .. } | Andi { rs1, .. } | Ori { rs1, .. }
+        | Xori { rs1, .. } | Slti { rs1, .. } | Sltiu { rs1, .. } | Slli { rs1, .. }
+        | Srli { rs1, .. } | Srai { rs1, .. } | Slliw { rs1, .. } | Srliw { rs1, .. }
+        | Sraiw { rs1, .. } | Jalr { rs1, .. } | Load { rs1, .. } => ([rs1, 0], 1),
+        Add { rs1, rs2, .. } | Sub { rs1, rs2, .. } | And { rs1, rs2, .. }
+        | Or { rs1, rs2, .. } | Xor { rs1, rs2, .. } | Sll { rs1, rs2, .. }
+        | Srl { rs1, rs2, .. } | Sra { rs1, rs2, .. } | Slt { rs1, rs2, .. }
+        | Sltu { rs1, rs2, .. } | Addw { rs1, rs2, .. } | Subw { rs1, rs2, .. }
+        | Sllw { rs1, rs2, .. } | Srlw { rs1, rs2, .. } | Sraw { rs1, rs2, .. }
+        | Beq { rs1, rs2, .. } | Bne { rs1, rs2, .. } | Blt { rs1, rs2, .. }
+        | Bge { rs1, rs2, .. } | Bltu { rs1, rs2, .. } | Bgeu { rs1, rs2, .. }
+        | Store { rs1, rs2, .. } | MulDiv { rs1, rs2, .. } | Amo { rs1, rs2, .. } => {
+            ([rs1, rs2], 2)
+        }
+    }
+}
+
+/// The register an op writes via inline codegen (kept in a local when lifted).
+/// None for memory/AMO writebacks (a helper writes those — see
+/// `op_helper_write`), stores/branches (no register dest), and x0.
+fn op_lift_write(op: &Op) -> Option<u32> {
+    use Op::*;
+    let rd = match *op {
+        Const { rd, .. } | Addi { rd, .. } | Addiw { rd, .. } | Andi { rd, .. }
+        | Ori { rd, .. } | Xori { rd, .. } | Slti { rd, .. } | Sltiu { rd, .. }
+        | Slli { rd, .. } | Srli { rd, .. } | Srai { rd, .. } | Slliw { rd, .. }
+        | Srliw { rd, .. } | Sraiw { rd, .. } | Add { rd, .. } | Sub { rd, .. }
+        | And { rd, .. } | Or { rd, .. } | Xor { rd, .. } | Sll { rd, .. }
+        | Srl { rd, .. } | Sra { rd, .. } | Slt { rd, .. } | Sltu { rd, .. }
+        | Addw { rd, .. } | Subw { rd, .. } | Sllw { rd, .. } | Srlw { rd, .. }
+        | Sraw { rd, .. } | MulDiv { rd, .. } | Jal { rd, .. } | Jalr { rd, .. } => rd,
+        Load { .. } | Store { .. } | Amo { .. } | Beq { .. } | Bne { .. } | Blt { .. }
+        | Bge { .. } | Bltu { .. } | Bgeu { .. } => return None,
+    };
+    if rd != 0 { Some(rd) } else { None }
+}
+
+/// The register a C helper writes directly in guest memory (load.rd, amo.rd,
+/// nonzero). These are excluded from lifting so a local can't diverge from the
+/// memory the helper updates.
+fn op_helper_write(op: &Op) -> Option<u32> {
+    match *op {
+        Op::Load { rd, .. } | Op::Amo { rd, .. } if rd != 0 => Some(rd),
+        _ => None,
+    }
+}
+
+/// Build the register-lifting plan: which registers get a local, which must be
+/// loaded at entry, which spilled at exit. `base` is the first local index free
+/// after scratch (and chain) locals. See [Lift] for the correctness rules.
+fn analyze_lift(ops: &[Op], base: u32) -> Lift {
+    // Registers a helper writes in memory — never lifted.
+    let mut helper_written: Vec<u32> = Vec::new();
+    for op in ops {
+        if let Some(o) = op_helper_write(op) {
+            if !helper_written.contains(&o) {
+                helper_written.push(o);
+            }
+        }
+    }
+    // A fault can only occur at a memory/AMO op; their presence forces the
+    // safety entry-load of every written register (invariant 3).
+    let has_fault = ops
+        .iter()
+        .any(|op| matches!(op, Op::Load { .. } | Op::Store { .. } | Op::Amo { .. }));
+
+    // Walk in order, recording first-appearance kind (read vs write) and
+    // whether the register is ever written by inline code. Reads are processed
+    // before the write within an op, matching execution order (e.g. add rd,rd,x
+    // counts rd as read-before-write).
+    // (off, first_is_read, written)
+    let mut infos: Vec<(u32, bool, bool)> = Vec::new();
+    for op in ops {
+        let (reads, n) = op_reads(op);
+        for &r in &reads[..n] {
+            if r == 0 || helper_written.contains(&r) {
+                continue; // x0 / helper-backed: not lifted
+            }
+            if !infos.iter().any(|(o, _, _)| *o == r) {
+                infos.push((r, true, false));
+            }
+        }
+        if let Some(w) = op_lift_write(op) {
+            if w == 0 || helper_written.contains(&w) {
+                continue;
+            }
+            if let Some(info) = infos.iter_mut().find(|(o, _, _)| *o == w) {
+                info.2 = true;
+            } else {
+                infos.push((w, false, true));
+            }
+        }
+    }
+
+    let mut regs = Vec::with_capacity(infos.len());
+    let mut entry = Vec::new();
+    for (i, &(off, first_read, written)) in infos.iter().enumerate() {
+        let local = base + i as u32;
+        regs.push((off, local, written));
+        if first_read || (written && has_fault) {
+            entry.push((off, local));
+        }
+    }
+    Lift { regs, entry }
+}
+
+/// Emit the entry prologue that loads lifted registers from guest memory into
+/// their locals. Stack-neutral.
+fn emit_entry_loads(f: &mut Function, lift: &Lift) {
+    for &(off, local) in &lift.entry {
+        f.instruction(&Instruction::LocalGet(0));
+        f.instruction(&Instruction::I64Load(memarg64(off)));
+        f.instruction(&Instruction::LocalSet(local));
+    }
+}
+
+/// Spill every written lifted register back to guest memory. Stack-neutral, so
+/// it can run with a terminator's next_pc already on the stack. Emitted at the
+/// normal block end and at the mid-block fault bail.
+fn spill(f: &mut Function, ctx: &Ctx) {
+    for &(off, local, written) in &ctx.lift.regs {
+        if written {
+            f.instruction(&Instruction::LocalGet(0));
+            f.instruction(&Instruction::LocalGet(local));
+            f.instruction(&Instruction::I64Store(memarg64(off)));
+        }
+    }
+}
+
 /// Per-block codegen context: constants baked into emitted code plus the
 /// mapping from helper id to this module's function-import index.
 struct Ctx {
@@ -150,6 +328,7 @@ struct Ctx {
     block_end_pc: u64,
     helper_import_idx: [Option<u32>; 13],
     tlb: Option<TlbLayout>,
+    lift: Lift,
 }
 
 /// Locals used by the chain epilogue, appended after the existing scratch
@@ -179,6 +358,7 @@ pub fn build_block(
     n_insns: u32,
     tlb: Option<&TlbLayout>,
     chain: Option<&ChainLayout>,
+    lift_flag: bool,
 ) -> (Vec<u8>, Vec<usize>) {
     let ops = parse_ir(ir);
 
@@ -270,23 +450,37 @@ pub fn build_block(
     exports.export("block", ExportKind::Func, block_func_idx);
     module.section(&exports);
 
-    let ctx = Ctx {
-        start_pc,
-        block_end_pc,
-        helper_import_idx,
-        tlb: tlb.copied(),
-    };
-
     // Code. Locals: 1 (i64) = JALR new_pc stash (avoids rs1 == rd hazard),
     // 2 (i64) = mem-op effective address, 3 (i32) = TLB entry pointer,
     // 4-6 (i64) = MUL/DIV scratch (a, b, mulh sign-correction). 1 and 2
     // double as mulhu partial-product scratch — they're free between ops.
     // Chain mode appends 7 (i64) = next_pc, 8 (i32) = map-entry pointer.
+    // Register lifting (Batch 6) appends one i64 local per lifted register
+    // after all scratch/chain locals — base 7 (no chain) or 9 (chain).
+    let lift_base: u32 = if chain.is_some() { 9 } else { 7 };
+    let lift = if lift_flag {
+        analyze_lift(&ops, lift_base)
+    } else {
+        Lift::empty()
+    };
+    let n_lift = lift.regs.len() as u32;
+
+    let ctx = Ctx {
+        start_pc,
+        block_end_pc,
+        helper_import_idx,
+        tlb: tlb.copied(),
+        lift,
+    };
+
     let mut codes = CodeSection::new();
     let mut locals = vec![(2, ValType::I64), (1, ValType::I32), (3, ValType::I64)];
     if chain.is_some() {
         locals.push((1, ValType::I64));
         locals.push((1, ValType::I32));
+    }
+    if n_lift > 0 {
+        locals.push((n_lift, ValType::I64));
     }
     let mut f = Function::new(locals);
     if let Some(c) = chain {
@@ -301,8 +495,15 @@ pub fn build_block(
         f.instruction(&Instruction::I32Sub);
         f.instruction(&Instruction::I32Store(memarg32(c.n_cycles_off)));
     }
+    // Lift prologue: prime locals from guest memory (invariant 3 in [Lift]).
+    emit_entry_loads(&mut f, &ctx.lift);
     let ends_with_terminator = ops.last().map(Op::is_terminator).unwrap_or(false);
     emit_ops(&mut f, &ops, &ctx);
+    // Spill lifted registers back to guest memory before any normal exit, so
+    // the interpreter / chained next block / C dispatch loop sees fresh
+    // values. Stack-neutral: a terminator's next_pc (already on the stack)
+    // stays on top. The mid-block fault bail spills separately in fault_check.
+    spill(&mut f, &ctx);
     // Non-terminator block: fall through to the static end-PC constant.
     // Terminator block: the last op already left next_pc on the stack.
     if !ends_with_terminator {
@@ -336,189 +537,189 @@ fn emit_one(f: &mut Function, op: &Op, ctx: &Ctx) {
     match *op {
         // rd = imm (LUI, LI)
         Const { rd, imm } => {
-            // state_ptr on stack as store addr; value; store.
-            f.instruction(&Instruction::LocalGet(0));
+            // store addr (lifted -> nothing); value; store.
+            begin_store(f, rd, ctx);
             f.instruction(&Instruction::I64Const(imm));
-            store_reg(f, rd);
+            store_reg(f, rd, ctx);
         }
 
         // rd = rs1 + imm  (ADDI variants, also AUIPC where imm = pc + imm<<12)
         Addi { rd, rs1, imm } => {
-            f.instruction(&Instruction::LocalGet(0));
-            load_reg(f, rs1);
+            begin_store(f, rd, ctx);
+            load_reg(f, rs1, ctx);
             f.instruction(&Instruction::I64Const(imm));
             f.instruction(&Instruction::I64Add);
-            store_reg(f, rd);
+            store_reg(f, rd, ctx);
         }
         // rd = sext32(rs1 + imm)
         Addiw { rd, rs1, imm } => {
-            f.instruction(&Instruction::LocalGet(0));
-            load_reg(f, rs1);
+            begin_store(f, rd, ctx);
+            load_reg(f, rs1, ctx);
             f.instruction(&Instruction::I64Const(imm));
             f.instruction(&Instruction::I64Add);
             f.instruction(&Instruction::I32WrapI64);
             f.instruction(&Instruction::I64ExtendI32S);
-            store_reg(f, rd);
+            store_reg(f, rd, ctx);
         }
         // rd = rs1 & imm
-        Andi { rd, rs1, imm } => bin_imm(f, rd, rs1, imm, &Instruction::I64And),
-        Ori { rd, rs1, imm } => bin_imm(f, rd, rs1, imm, &Instruction::I64Or),
-        Xori { rd, rs1, imm } => bin_imm(f, rd, rs1, imm, &Instruction::I64Xor),
+        Andi { rd, rs1, imm } => bin_imm(f, rd, rs1, imm, &Instruction::I64And, ctx),
+        Ori { rd, rs1, imm } => bin_imm(f, rd, rs1, imm, &Instruction::I64Or, ctx),
+        Xori { rd, rs1, imm } => bin_imm(f, rd, rs1, imm, &Instruction::I64Xor, ctx),
 
         // Shifts (i-form, shift amount in imm)
         Slli { rd, rs1, shamt } => {
-            f.instruction(&Instruction::LocalGet(0));
-            load_reg(f, rs1);
+            begin_store(f, rd, ctx);
+            load_reg(f, rs1, ctx);
             f.instruction(&Instruction::I64Const(shamt as i64));
             f.instruction(&Instruction::I64Shl);
-            store_reg(f, rd);
+            store_reg(f, rd, ctx);
         }
         Srli { rd, rs1, shamt } => {
-            f.instruction(&Instruction::LocalGet(0));
-            load_reg(f, rs1);
+            begin_store(f, rd, ctx);
+            load_reg(f, rs1, ctx);
             f.instruction(&Instruction::I64Const(shamt as i64));
             f.instruction(&Instruction::I64ShrU);
-            store_reg(f, rd);
+            store_reg(f, rd, ctx);
         }
         Srai { rd, rs1, shamt } => {
-            f.instruction(&Instruction::LocalGet(0));
-            load_reg(f, rs1);
+            begin_store(f, rd, ctx);
+            load_reg(f, rs1, ctx);
             f.instruction(&Instruction::I64Const(shamt as i64));
             f.instruction(&Instruction::I64ShrS);
-            store_reg(f, rd);
+            store_reg(f, rd, ctx);
         }
         Slliw { rd, rs1, shamt } => {
-            f.instruction(&Instruction::LocalGet(0));
-            load_reg(f, rs1);
+            begin_store(f, rd, ctx);
+            load_reg(f, rs1, ctx);
             f.instruction(&Instruction::I32WrapI64);
             f.instruction(&Instruction::I32Const(shamt as i32));
             f.instruction(&Instruction::I32Shl);
             f.instruction(&Instruction::I64ExtendI32S);
-            store_reg(f, rd);
+            store_reg(f, rd, ctx);
         }
         Srliw { rd, rs1, shamt } => {
-            f.instruction(&Instruction::LocalGet(0));
-            load_reg(f, rs1);
+            begin_store(f, rd, ctx);
+            load_reg(f, rs1, ctx);
             f.instruction(&Instruction::I32WrapI64);
             f.instruction(&Instruction::I32Const(shamt as i32));
             f.instruction(&Instruction::I32ShrU);
             f.instruction(&Instruction::I64ExtendI32S);
-            store_reg(f, rd);
+            store_reg(f, rd, ctx);
         }
         Sraiw { rd, rs1, shamt } => {
-            f.instruction(&Instruction::LocalGet(0));
-            load_reg(f, rs1);
+            begin_store(f, rd, ctx);
+            load_reg(f, rs1, ctx);
             f.instruction(&Instruction::I32WrapI64);
             f.instruction(&Instruction::I32Const(shamt as i32));
             f.instruction(&Instruction::I32ShrS);
             f.instruction(&Instruction::I64ExtendI32S);
-            store_reg(f, rd);
+            store_reg(f, rd, ctx);
         }
         // rd = (rs1 < imm) signed/unsigned
         Slti { rd, rs1, imm } => {
-            f.instruction(&Instruction::LocalGet(0));
-            load_reg(f, rs1);
+            begin_store(f, rd, ctx);
+            load_reg(f, rs1, ctx);
             f.instruction(&Instruction::I64Const(imm));
             f.instruction(&Instruction::I64LtS);
             f.instruction(&Instruction::I64ExtendI32U);
-            store_reg(f, rd);
+            store_reg(f, rd, ctx);
         }
         Sltiu { rd, rs1, imm } => {
-            f.instruction(&Instruction::LocalGet(0));
-            load_reg(f, rs1);
+            begin_store(f, rd, ctx);
+            load_reg(f, rs1, ctx);
             f.instruction(&Instruction::I64Const(imm));
             f.instruction(&Instruction::I64LtU);
             f.instruction(&Instruction::I64ExtendI32U);
-            store_reg(f, rd);
+            store_reg(f, rd, ctx);
         }
 
         // R-form
-        Add { rd, rs1, rs2 } => bin_reg(f, rd, rs1, rs2, &Instruction::I64Add),
-        Sub { rd, rs1, rs2 } => bin_reg(f, rd, rs1, rs2, &Instruction::I64Sub),
-        And { rd, rs1, rs2 } => bin_reg(f, rd, rs1, rs2, &Instruction::I64And),
-        Or { rd, rs1, rs2 } => bin_reg(f, rd, rs1, rs2, &Instruction::I64Or),
-        Xor { rd, rs1, rs2 } => bin_reg(f, rd, rs1, rs2, &Instruction::I64Xor),
+        Add { rd, rs1, rs2 } => bin_reg(f, rd, rs1, rs2, &Instruction::I64Add, ctx),
+        Sub { rd, rs1, rs2 } => bin_reg(f, rd, rs1, rs2, &Instruction::I64Sub, ctx),
+        And { rd, rs1, rs2 } => bin_reg(f, rd, rs1, rs2, &Instruction::I64And, ctx),
+        Or { rd, rs1, rs2 } => bin_reg(f, rd, rs1, rs2, &Instruction::I64Or, ctx),
+        Xor { rd, rs1, rs2 } => bin_reg(f, rd, rs1, rs2, &Instruction::I64Xor, ctx),
         Sll { rd, rs1, rs2 } => {
-            f.instruction(&Instruction::LocalGet(0));
-            load_reg(f, rs1);
-            load_reg(f, rs2);
+            begin_store(f, rd, ctx);
+            load_reg(f, rs1, ctx);
+            load_reg(f, rs2, ctx);
             f.instruction(&Instruction::I64Const(0x3f));
             f.instruction(&Instruction::I64And);
             f.instruction(&Instruction::I64Shl);
-            store_reg(f, rd);
+            store_reg(f, rd, ctx);
         }
         Srl { rd, rs1, rs2 } => {
-            f.instruction(&Instruction::LocalGet(0));
-            load_reg(f, rs1);
-            load_reg(f, rs2);
+            begin_store(f, rd, ctx);
+            load_reg(f, rs1, ctx);
+            load_reg(f, rs2, ctx);
             f.instruction(&Instruction::I64Const(0x3f));
             f.instruction(&Instruction::I64And);
             f.instruction(&Instruction::I64ShrU);
-            store_reg(f, rd);
+            store_reg(f, rd, ctx);
         }
         Sra { rd, rs1, rs2 } => {
-            f.instruction(&Instruction::LocalGet(0));
-            load_reg(f, rs1);
-            load_reg(f, rs2);
+            begin_store(f, rd, ctx);
+            load_reg(f, rs1, ctx);
+            load_reg(f, rs2, ctx);
             f.instruction(&Instruction::I64Const(0x3f));
             f.instruction(&Instruction::I64And);
             f.instruction(&Instruction::I64ShrS);
-            store_reg(f, rd);
+            store_reg(f, rd, ctx);
         }
         Slt { rd, rs1, rs2 } => {
-            f.instruction(&Instruction::LocalGet(0));
-            load_reg(f, rs1);
-            load_reg(f, rs2);
+            begin_store(f, rd, ctx);
+            load_reg(f, rs1, ctx);
+            load_reg(f, rs2, ctx);
             f.instruction(&Instruction::I64LtS);
             f.instruction(&Instruction::I64ExtendI32U);
-            store_reg(f, rd);
+            store_reg(f, rd, ctx);
         }
         Sltu { rd, rs1, rs2 } => {
-            f.instruction(&Instruction::LocalGet(0));
-            load_reg(f, rs1);
-            load_reg(f, rs2);
+            begin_store(f, rd, ctx);
+            load_reg(f, rs1, ctx);
+            load_reg(f, rs2, ctx);
             f.instruction(&Instruction::I64LtU);
             f.instruction(&Instruction::I64ExtendI32U);
-            store_reg(f, rd);
+            store_reg(f, rd, ctx);
         }
         // 32-bit R-form: compute on low 32 bits, sign-extend to 64.
-        Addw { rd, rs1, rs2 } => bin32(f, rd, rs1, rs2, &Instruction::I32Add),
-        Subw { rd, rs1, rs2 } => bin32(f, rd, rs1, rs2, &Instruction::I32Sub),
+        Addw { rd, rs1, rs2 } => bin32(f, rd, rs1, rs2, &Instruction::I32Add, ctx),
+        Subw { rd, rs1, rs2 } => bin32(f, rd, rs1, rs2, &Instruction::I32Sub, ctx),
         Sllw { rd, rs1, rs2 } => {
-            f.instruction(&Instruction::LocalGet(0));
-            load_reg(f, rs1);
+            begin_store(f, rd, ctx);
+            load_reg(f, rs1, ctx);
             f.instruction(&Instruction::I32WrapI64);
-            load_reg(f, rs2);
+            load_reg(f, rs2, ctx);
             f.instruction(&Instruction::I32WrapI64);
             f.instruction(&Instruction::I32Const(0x1f));
             f.instruction(&Instruction::I32And);
             f.instruction(&Instruction::I32Shl);
             f.instruction(&Instruction::I64ExtendI32S);
-            store_reg(f, rd);
+            store_reg(f, rd, ctx);
         }
         Srlw { rd, rs1, rs2 } => {
-            f.instruction(&Instruction::LocalGet(0));
-            load_reg(f, rs1);
+            begin_store(f, rd, ctx);
+            load_reg(f, rs1, ctx);
             f.instruction(&Instruction::I32WrapI64);
-            load_reg(f, rs2);
+            load_reg(f, rs2, ctx);
             f.instruction(&Instruction::I32WrapI64);
             f.instruction(&Instruction::I32Const(0x1f));
             f.instruction(&Instruction::I32And);
             f.instruction(&Instruction::I32ShrU);
             f.instruction(&Instruction::I64ExtendI32S);
-            store_reg(f, rd);
+            store_reg(f, rd, ctx);
         }
         Sraw { rd, rs1, rs2 } => {
-            f.instruction(&Instruction::LocalGet(0));
-            load_reg(f, rs1);
+            begin_store(f, rd, ctx);
+            load_reg(f, rs1, ctx);
             f.instruction(&Instruction::I32WrapI64);
-            load_reg(f, rs2);
+            load_reg(f, rs2, ctx);
             f.instruction(&Instruction::I32WrapI64);
             f.instruction(&Instruction::I32Const(0x1f));
             f.instruction(&Instruction::I32And);
             f.instruction(&Instruction::I32ShrS);
             f.instruction(&Instruction::I64ExtendI32S);
-            store_reg(f, rd);
+            store_reg(f, rd, ctx);
         }
 
         // Terminators. Each leaves `next_pc: i64` on the stack as the
@@ -527,34 +728,34 @@ fn emit_one(f: &mut Function, op: &Op, ctx: &Ctx) {
         // fallthrough_pc for Bxx.
         Jal { rd, target_pc } => {
             if rd != 0 {
-                f.instruction(&Instruction::LocalGet(0));
+                begin_store(f, rd, ctx);
                 f.instruction(&Instruction::I64Const(block_end_pc as i64));
-                store_reg(f, rd);
+                store_reg(f, rd, ctx);
             }
             f.instruction(&Instruction::I64Const(target_pc));
         }
         Jalr { rd, rs1, imm } => {
             // Compute new_pc = (reg[rs1] + imm) & ~1, stash in local 1 before
             // writing the link register, in case rd == rs1.
-            load_reg(f, rs1);
+            load_reg(f, rs1, ctx);
             f.instruction(&Instruction::I64Const(imm));
             f.instruction(&Instruction::I64Add);
             f.instruction(&Instruction::I64Const(-2)); // ~1 in i64
             f.instruction(&Instruction::I64And);
             f.instruction(&Instruction::LocalSet(1));
             if rd != 0 {
-                f.instruction(&Instruction::LocalGet(0));
+                begin_store(f, rd, ctx);
                 f.instruction(&Instruction::I64Const(block_end_pc as i64));
-                store_reg(f, rd);
+                store_reg(f, rd, ctx);
             }
             f.instruction(&Instruction::LocalGet(1));
         }
-        Beq { rs1, rs2, target_pc } => branch(f, rs1, rs2, target_pc, block_end_pc, &Instruction::I64Eq),
-        Bne { rs1, rs2, target_pc } => branch(f, rs1, rs2, target_pc, block_end_pc, &Instruction::I64Ne),
-        Blt { rs1, rs2, target_pc } => branch(f, rs1, rs2, target_pc, block_end_pc, &Instruction::I64LtS),
-        Bge { rs1, rs2, target_pc } => branch(f, rs1, rs2, target_pc, block_end_pc, &Instruction::I64GeS),
-        Bltu { rs1, rs2, target_pc } => branch(f, rs1, rs2, target_pc, block_end_pc, &Instruction::I64LtU),
-        Bgeu { rs1, rs2, target_pc } => branch(f, rs1, rs2, target_pc, block_end_pc, &Instruction::I64GeU),
+        Beq { rs1, rs2, target_pc } => branch(f, rs1, rs2, target_pc, block_end_pc, &Instruction::I64Eq, ctx),
+        Bne { rs1, rs2, target_pc } => branch(f, rs1, rs2, target_pc, block_end_pc, &Instruction::I64Ne, ctx),
+        Blt { rs1, rs2, target_pc } => branch(f, rs1, rs2, target_pc, block_end_pc, &Instruction::I64LtS, ctx),
+        Bge { rs1, rs2, target_pc } => branch(f, rs1, rs2, target_pc, block_end_pc, &Instruction::I64GeS, ctx),
+        Bltu { rs1, rs2, target_pc } => branch(f, rs1, rs2, target_pc, block_end_pc, &Instruction::I64LtU, ctx),
+        Bgeu { rs1, rs2, target_pc } => branch(f, rs1, rs2, target_pc, block_end_pc, &Instruction::I64GeU, ctx),
 
         // Memory ops. With a TlbLayout (Batch 5): probe the guest's live TLB
         // inline — tag hit means a naturally aligned RAM access, performed
@@ -565,7 +766,8 @@ fn emit_one(f: &mut Function, op: &Op, ctx: &Ctx) {
         // faulting insn's pc, tagged with bit 0 so the interpreter
         // re-executes that insn and raises the exception. The inline fast
         // path cannot fault: a live TLB entry proves the page is mapped RAM
-        // with this access type permitted.
+        // with this access type permitted. rd of a load is helper-written, so
+        // it is never lifted (begin_store/store_reg here always hit memory).
         Load { w, rd, rs1, imm, pc_off } => {
             let fault_pc = ctx.start_pc + pc_off as u64;
             let helper = ctx.helper_import_idx[helper_id(op).unwrap()].unwrap();
@@ -576,11 +778,11 @@ fn emit_one(f: &mut Function, op: &Op, ctx: &Ctx) {
                     LoadW::W | LoadW::Wu => 4,
                     LoadW::D => 8,
                 };
-                tlb_probe(f, t, rs1, imm, t.tlb_read_off, bytes);
+                tlb_probe(f, t, rs1, imm, t.tlb_read_off, bytes, ctx);
                 f.instruction(&Instruction::If(BlockType::Empty));
                 // Fast: value = mem[addend + wrap32(addr)], width-extended.
                 if rd != 0 {
-                    f.instruction(&Instruction::LocalGet(0)); // writeback base
+                    begin_store(f, rd, ctx); // writeback base
                 }
                 tlb_host_addr(f, t, t.tlb_read_off);
                 let arg = |align| MemArg { offset: 0, align, memory_index: 0 };
@@ -594,7 +796,7 @@ fn emit_one(f: &mut Function, op: &Op, ctx: &Ctx) {
                     LoadW::D => Instruction::I64Load(arg(3)),
                 });
                 if rd != 0 {
-                    store_reg(f, rd);
+                    store_reg(f, rd, ctx);
                 } else {
                     // Load to x0: the access architecturally has no effect on
                     // RAM; we still perform it to stay shaped like the helper.
@@ -605,16 +807,16 @@ fn emit_one(f: &mut Function, op: &Op, ctx: &Ctx) {
                 f.instruction(&Instruction::LocalGet(2)); // addr
                 f.instruction(&Instruction::I32Const(rd as i32)); // rd_off, 0 = x0
                 f.instruction(&Instruction::Call(helper));
-                fault_check(f, fault_pc);
+                fault_check(f, fault_pc, ctx);
                 f.instruction(&Instruction::End);
             } else {
                 f.instruction(&Instruction::LocalGet(0)); // state
-                load_reg(f, rs1);
+                load_reg(f, rs1, ctx);
                 f.instruction(&Instruction::I64Const(imm));
                 f.instruction(&Instruction::I64Add); // addr
                 f.instruction(&Instruction::I32Const(rd as i32)); // rd_off, 0 = x0
                 f.instruction(&Instruction::Call(helper));
-                fault_check(f, fault_pc);
+                fault_check(f, fault_pc, ctx);
             }
         }
         Store { w, rs1, rs2, imm, pc_off } => {
@@ -627,10 +829,10 @@ fn emit_one(f: &mut Function, op: &Op, ctx: &Ctx) {
                     StoreW::W => 4,
                     StoreW::D => 8,
                 };
-                tlb_probe(f, t, rs1, imm, t.tlb_write_off, bytes);
+                tlb_probe(f, t, rs1, imm, t.tlb_write_off, bytes, ctx);
                 f.instruction(&Instruction::If(BlockType::Empty));
                 tlb_host_addr(f, t, t.tlb_write_off);
-                load_reg(f, rs2); // val
+                load_reg(f, rs2, ctx); // val
                 let arg = |align| MemArg { offset: 0, align, memory_index: 0 };
                 f.instruction(&match w {
                     StoreW::B => Instruction::I64Store8(arg(0)),
@@ -641,38 +843,39 @@ fn emit_one(f: &mut Function, op: &Op, ctx: &Ctx) {
                 f.instruction(&Instruction::Else);
                 f.instruction(&Instruction::LocalGet(0)); // state
                 f.instruction(&Instruction::LocalGet(2)); // addr
-                load_reg(f, rs2); // val
+                load_reg(f, rs2, ctx); // val
                 f.instruction(&Instruction::Call(helper));
-                fault_check(f, fault_pc);
+                fault_check(f, fault_pc, ctx);
                 f.instruction(&Instruction::End);
             } else {
                 f.instruction(&Instruction::LocalGet(0)); // state
-                load_reg(f, rs1);
+                load_reg(f, rs1, ctx);
                 f.instruction(&Instruction::I64Const(imm));
                 f.instruction(&Instruction::I64Add); // addr
-                load_reg(f, rs2); // val
+                load_reg(f, rs2, ctx); // val
                 f.instruction(&Instruction::Call(helper));
-                fault_check(f, fault_pc);
+                fault_check(f, fault_pc, ctx);
             }
         }
 
         // RV64M (Batch 4.5): inlined, see muldiv().
-        MulDiv { op: md, rd, rs1, rs2 } => muldiv(f, md, rd, rs1, rs2),
+        MulDiv { op: md, rd, rs1, rs2 } => muldiv(f, md, rd, rs1, rs2, ctx),
 
         // RV64A (Batch 4.5): helper call, same shape as loads/stores. The
         // helper performs the full LR/SC/AMO semantics (load_res handling,
         // read-modify-write, rd writeback) and returns nonzero on MMU fault.
-        // No displacement: the address is reg[rs1] directly.
+        // No displacement: the address is reg[rs1] directly. rd is
+        // helper-written, so it is never lifted.
         Amo { d: _, rd, rs1, rs2, funct5, pc_off } => {
             let fault_pc = ctx.start_pc + pc_off as u64;
             let helper = ctx.helper_import_idx[helper_id(op).unwrap()].unwrap();
             f.instruction(&Instruction::LocalGet(0)); // state
-            load_reg(f, rs1); // addr
-            load_reg(f, rs2); // val2
+            load_reg(f, rs1, ctx); // addr
+            load_reg(f, rs2, ctx); // val2
             f.instruction(&Instruction::I32Const(funct5 as i32));
             f.instruction(&Instruction::I32Const(rd as i32)); // rd_off, 0 = x0
             f.instruction(&Instruction::Call(helper));
-            fault_check(f, fault_pc);
+            fault_check(f, fault_pc, ctx);
         }
     }
 }
@@ -689,14 +892,14 @@ fn emit_one(f: &mut Function, op: &Op, ctx: &Ctx) {
 /// Locals 4/5 hold the operands (W-forms pre-narrowed so the 64-bit wasm op
 /// gives the 32-bit result exactly); local 6 the mulh correction; mulhu_core
 /// additionally clobbers 1/2 (free between ops).
-fn muldiv(f: &mut Function, op: MdOp, rd: u32, rs1: u32, rs2: u32) {
+fn muldiv(f: &mut Function, op: MdOp, rd: u32, rs1: u32, rs2: u32, ctx: &Ctx) {
     use Instruction::*;
     match op {
-        MdOp::Mul => return bin_reg(f, rd, rs1, rs2, &I64Mul),
-        MdOp::Mulw => return bin32(f, rd, rs1, rs2, &I32Mul),
+        MdOp::Mul => return bin_reg(f, rd, rs1, rs2, &I64Mul, ctx),
+        MdOp::Mulw => return bin32(f, rd, rs1, rs2, &I32Mul, ctx),
         _ => {}
     }
-    f.instruction(&LocalGet(0)); // store_reg address for the result
+    begin_store(f, rd, ctx); // store address for the result (lifted -> nothing)
     // Load operands into locals 4 (a) and 5 (b). W-forms narrow here: signed
     // ops sign-extend the low 32 bits, unsigned ops zero-extend, so the
     // 64-bit compare/divide below is exact 32-bit arithmetic.
@@ -706,7 +909,7 @@ fn muldiv(f: &mut Function, op: MdOp, rd: u32, rs1: u32, rs2: u32) {
         _ => None,
     };
     for (reg, local) in [(rs1, 4), (rs2, 5)] {
-        load_reg(f, reg);
+        load_reg(f, reg, ctx);
         if let Some(signed) = narrow {
             f.instruction(&I32WrapI64);
             f.instruction(if signed { &I64ExtendI32S } else { &I64ExtendI32U });
@@ -813,7 +1016,7 @@ fn muldiv(f: &mut Function, op: MdOp, rd: u32, rs1: u32, rs2: u32) {
         }
         MdOp::Mul | MdOp::Mulw => unreachable!(),
     }
-    store_reg(f, rd);
+    store_reg(f, rd, ctx);
 }
 
 /// With the operands in locals 4 (a) and 5 (b), leave mulhu(a, b) — the high
@@ -908,9 +1111,9 @@ fn mulhu_core(f: &mut Function) {
 /// tlb_write. Mirrors the C fast path:
 ///   idx  = (addr >> PG_SHIFT) & (TLB_SIZE - 1)
 ///   hit  = tlb[idx].vaddr == (addr & ~(PG_MASK & ~(bytes - 1)))
-fn tlb_probe(f: &mut Function, t: TlbLayout, rs1: u32, imm: i64, tlb_off: u32, bytes: u64) {
+fn tlb_probe(f: &mut Function, t: TlbLayout, rs1: u32, imm: i64, tlb_off: u32, bytes: u64, ctx: &Ctx) {
     // local 2 = addr = reg[rs1] + imm
-    load_reg(f, rs1);
+    load_reg(f, rs1, ctx);
     f.instruction(&Instruction::I64Const(imm));
     f.instruction(&Instruction::I64Add);
     f.instruction(&Instruction::LocalTee(2));
@@ -1059,8 +1262,13 @@ fn chain_epilogue(f: &mut Function, c: &ChainLayout) {
 /// Emit the post-helper fault check: nonzero return = MMU fault; bail out of
 /// the block returning the faulting insn's pc with bit 0 set (real pcs are
 /// even, so the tag is unambiguous to the dispatch hook).
-fn fault_check(f: &mut Function, fault_pc: u64) {
+fn fault_check(f: &mut Function, fault_pc: u64, ctx: &Ctx) {
     f.instruction(&Instruction::If(BlockType::Empty));
+    // Commit lifted registers before bailing: the interpreter re-executes the
+    // faulting insn and must see the values earlier ops in this block wrote.
+    // Registers written only after the fault hold their entry-loaded memory
+    // value (invariant 3 in [Lift]), so spilling them here is a no-op.
+    spill(f, ctx);
     f.instruction(&Instruction::I64Const((fault_pc | 1) as i64));
     f.instruction(&Instruction::Return);
     f.instruction(&Instruction::End);
@@ -1077,9 +1285,10 @@ fn branch(
     target_pc: i64,
     fallthrough_pc: u64,
     cmp: &Instruction,
+    ctx: &Ctx,
 ) {
-    load_reg(f, rs1);
-    load_reg(f, rs2);
+    load_reg(f, rs1, ctx);
+    load_reg(f, rs2, ctx);
     f.instruction(cmp);
     f.instruction(&Instruction::If(BlockType::Result(ValType::I64)));
     f.instruction(&Instruction::I64Const(target_pc));
@@ -1088,49 +1297,60 @@ fn branch(
     f.instruction(&Instruction::End);
 }
 
-fn load_reg(f: &mut Function, rs_off: u32) {
-    f.instruction(&Instruction::LocalGet(0));
-    f.instruction(&Instruction::I64Load(MemArg {
-        offset: rs_off as u64,
-        align: 3,
-        memory_index: 0,
-    }));
+/// Push the store-address base for a subsequent `store_reg(rd)`. For a
+/// memory-backed register that's the state pointer (so I64Store has its addr);
+/// for a lifted register nothing (store_reg becomes a local.set). Must be
+/// emitted in place of the leading `LocalGet(0)` that paired with store_reg.
+fn begin_store(f: &mut Function, rd_off: u32, ctx: &Ctx) {
+    if ctx.lift.local_of(rd_off).is_none() {
+        f.instruction(&Instruction::LocalGet(0));
+    }
 }
 
-fn store_reg(f: &mut Function, rd_off: u32) {
-    // expects [addr i32, val i64] on stack from caller.
-    f.instruction(&Instruction::I64Store(MemArg {
-        offset: rd_off as u64,
-        align: 3,
-        memory_index: 0,
-    }));
+fn load_reg(f: &mut Function, rs_off: u32, ctx: &Ctx) {
+    if let Some(l) = ctx.lift.local_of(rs_off) {
+        f.instruction(&Instruction::LocalGet(l));
+    } else {
+        f.instruction(&Instruction::LocalGet(0));
+        f.instruction(&Instruction::I64Load(memarg64(rs_off)));
+    }
 }
 
-fn bin_imm(f: &mut Function, rd: u32, rs1: u32, imm: i64, opcode: &Instruction) {
-    f.instruction(&Instruction::LocalGet(0));
-    load_reg(f, rs1);
+fn store_reg(f: &mut Function, rd_off: u32, ctx: &Ctx) {
+    if let Some(l) = ctx.lift.local_of(rd_off) {
+        // Lifted: consume just the value. begin_store(rd) emitted nothing.
+        f.instruction(&Instruction::LocalSet(l));
+    } else {
+        // Memory-backed: consume [addr i32, val i64] (addr from begin_store).
+        f.instruction(&Instruction::I64Store(memarg64(rd_off)));
+    }
+}
+
+fn bin_imm(f: &mut Function, rd: u32, rs1: u32, imm: i64, opcode: &Instruction, ctx: &Ctx) {
+    begin_store(f, rd, ctx);
+    load_reg(f, rs1, ctx);
     f.instruction(&Instruction::I64Const(imm));
     f.instruction(opcode);
-    store_reg(f, rd);
+    store_reg(f, rd, ctx);
 }
 
-fn bin_reg(f: &mut Function, rd: u32, rs1: u32, rs2: u32, opcode: &Instruction) {
-    f.instruction(&Instruction::LocalGet(0));
-    load_reg(f, rs1);
-    load_reg(f, rs2);
+fn bin_reg(f: &mut Function, rd: u32, rs1: u32, rs2: u32, opcode: &Instruction, ctx: &Ctx) {
+    begin_store(f, rd, ctx);
+    load_reg(f, rs1, ctx);
+    load_reg(f, rs2, ctx);
     f.instruction(opcode);
-    store_reg(f, rd);
+    store_reg(f, rd, ctx);
 }
 
-fn bin32(f: &mut Function, rd: u32, rs1: u32, rs2: u32, opcode: &Instruction) {
-    f.instruction(&Instruction::LocalGet(0));
-    load_reg(f, rs1);
+fn bin32(f: &mut Function, rd: u32, rs1: u32, rs2: u32, opcode: &Instruction, ctx: &Ctx) {
+    begin_store(f, rd, ctx);
+    load_reg(f, rs1, ctx);
     f.instruction(&Instruction::I32WrapI64);
-    load_reg(f, rs2);
+    load_reg(f, rs2, ctx);
     f.instruction(&Instruction::I32WrapI64);
     f.instruction(opcode);
     f.instruction(&Instruction::I64ExtendI32S);
-    store_reg(f, rd);
+    store_reg(f, rd, ctx);
 }
 
 /// Build a trivial wasm module used by the host pre-flight to validate the
